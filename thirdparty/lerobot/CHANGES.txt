@@ -1,0 +1,15 @@
+This is a vendored copy of LeRobot with minor modifications.
+
+Upstream: https://github.com/huggingface/lerobot
+Base commit: 483be9aa (2025-06-30)
+License: Apache-2.0
+
+Changes from upstream:
+
+1. lerobot/common/datasets/transforms.py
+   - Added 3 new image transform configs (all disabled by default with weight=0.0):
+     - rotation: RandomRotation (degrees: -15 to 15)
+     - affine: RandomAffine (degrees, translate, scale)
+     - perspective: RandomPerspective (distortion_scale: 0.2)
+   - Added corresponding make_transform_from_config branches for
+     RandomAffine, RandomRotation, RandomPerspective

@@ -1,0 +1,682 @@
+#!/usr/bin/env python
+
+"""Flow Matching Policy 实现"""
+from collections import deque
+from typing import Union
+
+import torch
+import torch.nn.functional as F
+import torchvision
+from diffusers import EMAModel
+from lerobot.common.constants import ACTION, OBS_IMAGES
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.configs.types import FeatureType, PolicyFeature
+from torch import Tensor, nn
+
+from .flow_model_config import FlowMatchingConfig
+from .flow_net_mlp import FlowMatchingMLPModel
+from .flow_net_unet import FlowMatchingUnetModel
+from .flow_net_residual_mlp import FlowMatchingResidualMLPModel
+from .noise_injection_network import NoiseInjectionNetwork
+
+
+# 视觉编码器辅助函数
+def get_resnet(name: str, weights=None, **kwargs) -> nn.Module:
+    """获取移除最终 FC 层的 ResNet 模型。"""
+    func = getattr(torchvision.models, name)
+    resnet = func(weights=weights, **kwargs)
+    resnet.fc = nn.Identity()
+    return resnet
+
+
+def replace_bn_with_gn(module: nn.Module, features_per_group: int = 16) -> nn.Module:
+    """将所有 BatchNorm 层替换为 GroupNorm。"""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            num_groups = child.num_features // features_per_group
+            setattr(module, name, nn.GroupNorm(num_groups, child.num_features))
+        else:
+            replace_bn_with_gn(child, features_per_group)
+    return module
+
+class FlowMatchingPolicy(PreTrainedPolicy):
+    """
+    用于行为克隆的 Flow Matching Policy 实现。
+    使用 continuous normalizing flow 和 flow matching loss。
+    """
+
+    config_class = FlowMatchingConfig
+    name = "flowmatching"
+
+    def __init__(
+        self,
+        config: FlowMatchingConfig,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
+    ):
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
+
+        # 创建用于归一化的 feature 字典
+        input_feature_dict = {}
+        for feat in config.input_features:
+            # 根据名称判断 feature 类型
+            if "image" in feat:
+                feat_type = FeatureType.VISUAL
+                shape = config.input_shapes.get(feat, (3, 96, 96))
+                # 必要时将 HWC 转为 CHW 格式
+                if len(shape) == 3 and shape[2] <= 4:  # Likely HWC format (e.g., 84, 84, 3)
+                    shape = (shape[2], shape[0], shape[1])  # Convert to CHW
+            elif "state" in feat or "pos" in feat:
+                feat_type = FeatureType.STATE
+                shape = config.input_shapes.get(feat, (2,))
+            else:
+                feat_type = FeatureType.ENV
+                shape = config.input_shapes.get(feat, (1,))
+
+            input_feature_dict[feat] = PolicyFeature(type=feat_type, shape=shape)
+
+        output_feature_dict = {}
+        for feat in config.output_features:
+            if feat == "action":
+                feat_type = FeatureType.ACTION
+                shape = config.output_shapes.get(feat, (2,))
+            else:
+                feat_type = FeatureType.ACTION
+                shape = config.output_shapes.get(feat, (1,))
+
+            output_feature_dict[feat] = PolicyFeature(type=feat_type, shape=shape)
+
+        # 归一化层
+        self.normalize_inputs = Normalize(input_feature_dict, config.normalization_mapping, dataset_stats)
+        self.normalize_targets = Normalize(output_feature_dict, config.normalization_mapping, dataset_stats)
+        self.unnormalize_outputs = Unnormalize(output_feature_dict, config.normalization_mapping, dataset_stats)
+
+        # 根据网络结构初始化 flow model
+        if config.network_architecture == "mlp":
+            self.model = FlowMatchingMLPModel(config)
+        elif config.network_architecture == "residual_mlp":
+            self.model = FlowMatchingResidualMLPModel(config)
+        elif config.network_architecture == "unet":
+            self.model = FlowMatchingUnetModel(config)
+        else:
+            raise ValueError(f"Unknown network_architecture: {config.network_architecture}")
+
+        # 当 ema_power > 0 时初始化 EMA model
+        self.ema_model = None
+        if config.ema_power > 0:
+            self.ema_model = EMAModel(
+                self.model.parameters(),
+                power=config.ema_power,
+                model_cls=type(self.model),
+                model_config=None,
+            )
+
+        # 探索噪声值 (can be set dynamically)
+        self.exploration_noise_std = config.exploration_noise_std  
+
+        self.num_envs = None
+        self.action_buffers = None
+
+        self.reset()
+
+    def init_action_buffers(self, num_envs: int):
+        # 初始化空 action buffer 字典 
+        self.num_envs = num_envs
+        self.action_buffers = {
+            env_id: deque([], maxlen=self.config.n_action_steps) for env_id in range(self.num_envs)
+        }
+        self.mdp_x_t_path_buffers = {
+            env_id: deque([], maxlen=self.config.n_action_steps) for env_id in range(self.num_envs)
+        }
+            
+    def get_optim_params(self) -> dict:
+        """获取优化器参数，并为 backbone 与其他部分使用不同学习率。"""
+        return [
+            {
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if not n.startswith("model.vision_encoder") and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p for n, p in self.named_parameters() if n.startswith("model.vision_encoder") and p.requires_grad
+                ],
+                "lr": self.config.optimizer_lr_backbone,
+            },
+        ]
+
+    def reset(self, env_ids: Tensor | None = None):
+        """重置指定环境的 action buffer；如果 env_ids 为 None，则重置全部环境。
+
+        Args:
+            env_ids: 可选 tensor of environment indices to reset. If None, resets all buffers.
+        """
+        if env_ids is None:
+            if self.num_envs is None:
+                self.action_buffers = {}
+                self.mdp_x_t_path_buffers = {}
+
+            else:
+                # 重置所有 buffer
+                for env_id in range(self.num_envs):
+                    self.action_buffers[env_id] = deque([], maxlen=self.config.n_action_steps)
+                    self.mdp_x_t_path_buffers[env_id] = deque([], maxlen=self.config.n_action_steps)
+        else:
+            # 只重置指定环境的 buffer
+            if not isinstance(env_ids, torch.Tensor):
+                env_ids = torch.tensor(env_ids)
+
+            for env_id in env_ids.tolist():
+                if env_id in self.action_buffers:
+                    self.action_buffers[env_id] = deque([], maxlen=self.config.n_action_steps)
+                    self.mdp_x_t_path_buffers[env_id] = deque([], maxlen=self.config.n_action_steps)
+    def step_ema(self):
+        """使用当前模型参数更新 EMA model。"""
+        if self.ema_model is not None:
+            self.ema_model.step(self.model.parameters())
+
+    def enable_ema(self):
+        """切换为使用 EMA 权重进行推理。"""
+        if self.ema_model is not None:
+            # 复制 EMA 权重前保存当前参数
+            self.ema_model.store(self.model.parameters())
+            # 将 EMA 权重复制到模型
+            self.ema_model.copy_to(self.model.parameters())
+
+    def disable_ema(self):
+        """使用 EMA 后恢复原始权重。"""
+        if self.ema_model is not None:
+            # 恢复参数 that were stored in enable_ema()
+            self.ema_model.restore(self.model.parameters())
+
+    def get_schedule(self, device: torch.device) -> Tensor:
+        """获取 flow matching schedule。"""
+        return torch.linspace(1.0, 0.0, self.config.sampling_steps + 1, device=device)
+
+    @torch.no_grad
+    def select_action(self, batch: dict[str, Tensor], zero_sampling: bool = False, sde_sampling: bool = False) -> Tensor:
+        """使用独立 buffer 为多个环境选择 action。
+        
+        Args:
+            batch: Dictionary of observations with tensors of shape (num_envs, ...)
+            
+        Returns:
+            Tensor of actions with shape (num_envs, action_dim)
+        """
+        self.eval()
+        
+        if self.num_envs is None and self.action_buffers is None:
+            raise ValueError("Action buffers not initialized. Call init_action_buffers first.")
+        
+        # 检查哪些环境需要新的 action chunk
+        envs_needing_actions = []
+        for env_id in range(self.num_envs):
+            if len(self.action_buffers[env_id]) == 0:
+                envs_needing_actions.append(env_id)
+        
+        # 为需要的环境生成新的 action chunk
+        if envs_needing_actions:
+            # 为需要 action 的环境创建 batch
+            sub_batch = {}
+            for key, value in batch.items():
+                sub_batch[key] = value[envs_needing_actions]
+
+            # 预测这些环境的 action chunk
+            action_chunks, mdp_x_t_path = self.predict_action_chunk(sub_batch, zero_sampling=zero_sampling, sde_sampling=sde_sampling)
+            action_chunks = action_chunks[:, :self.config.n_action_steps, :] # in future, the n_action_steps can be different from prediction horizon
+            mdp_x_t_path = mdp_x_t_path[:, :, :self.config.n_action_steps, :] # in future, the n_action_steps can be different from prediction horizon
+            assert mdp_x_t_path.shape[1] == self.config.sampling_steps, "mdp_x_t_path second axis should be the flow sampling steps"
+            assert action_chunks.shape[1] == self.config.n_action_steps, "action_chunks second axis should be the number of action steps"
+
+            # 填充这些环境的 buffer
+            for i, env_id in enumerate(envs_needing_actions):
+                # Transpose to get actions for this environment across timesteps
+                self.action_buffers[env_id].extend(action_chunks[i])
+                self.mdp_x_t_path_buffers[env_id].extend(mdp_x_t_path[i].transpose(0,1))
+
+        # 收集所有环境的 action
+        actions = []
+        mdp_x_t_paths = []
+        for env_id in range(self.num_envs):
+            actions.append(self.action_buffers[env_id].popleft())
+            mdp_x_t_paths.append(self.mdp_x_t_path_buffers[env_id].popleft())
+
+        assert len(actions) == self.num_envs, "actions length should be the number of environments"
+        assert len(mdp_x_t_paths) == self.num_envs, "mdp_x_t_paths length should be the number of environments"
+        
+        return torch.stack(actions), torch.stack(mdp_x_t_paths)
+
+    @torch.no_grad
+    def predict_action_chunk(self, batch: dict[str, Tensor], zero_sampling: bool = False, sde_sampling: bool = False) -> Tensor:
+        """Predict a chunk of actions using flow matching with Euler 积分."""
+        self.eval()
+
+        # 归一化输入
+        batch = self.normalize_inputs(batch)
+
+        # 获取 observation conditioning
+        obs_cond = self.model.encode_observations(batch)
+
+        # 从高斯噪声初始化
+        B = obs_cond.shape[0]
+        if zero_sampling:
+            x_t = torch.zeros((B, self.config.horizon, self.model.action_dim), device=obs_cond.device)
+        else:
+            x_t = torch.randn((B, self.config.horizon, self.model.action_dim), device=obs_cond.device)
+
+        # Euler 积分的 flow schedule
+        flow_steps = self.config.sampling_steps
+        # t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=x_t.device)
+        t_path = self.get_schedule(x_t.device)
+        mdp_x_t_path = torch.zeros((B, flow_steps, self.config.horizon, self.model.action_dim), device=x_t.device)
+
+        if sde_sampling:
+            sde_sigma = self.get_sde_sigma(obs_cond, x_t.device)
+            if sde_sigma.shape == (B, self.config.horizon, 1, self.model.action_dim):
+                sde_sigma = sde_sigma.expand(B, self.config.horizon, flow_steps, self.model.action_dim)
+            elif sde_sigma.shape == (flow_steps,):
+                sde_sigma = sde_sigma.unsqueeze(0).unsqueeze(0).unsqueeze(-1).expand(B, self.config.horizon, flow_steps, self.model.action_dim)
+            else:
+                raise ValueError(f"sde_sigma shape should be (B, horizon, 1, D) or (flow_steps,), but got {sde_sigma.shape}")
+
+        # Euler 积分 from t=1 to t=0
+        for i in range(flow_steps):
+            t_current = t_path[i]
+            t_next = t_path[i + 1]
+            dt = t_next - t_current  # Negative value since we go from 1 to 0
+            
+            timeembedding = self.model.diffusion_step_encoder(torch.tensor([t_current], device=x_t.device))
+            assert timeembedding.shape == (1, self.config.timestep_embed_dim)
+            timeembedding = timeembedding.expand(B, -1)
+
+            # 根据输出参数化方式进行预测
+            network_output = self.model(x_t, timeembedding, obs_cond)
+            network_output = self.config.mlp_output_scale * network_output
+            assert network_output.shape == (B, self.config.horizon, self.model.action_dim), "network_output shape should be (B, horizon, action_dim)"
+
+            # 如果已配置则应用 clipping
+            if self.config.transported_clip_value is not None:
+                network_output = network_output.clamp(-self.config.transported_clip_value, self.config.transported_clip_value)
+
+            if self.config.flow_network_output_param == "u":
+                # 直接预测速度
+                velocity = network_output
+            elif self.config.flow_network_output_param == "x0":
+                # x0 预测模式: 从 x0 计算速度
+                x0_pred = network_output
+                # 速度: u = (x_t - x0) / t for t > 0
+                if t_current > 1e-5:  # Avoid division by zero
+                    velocity = (x_t - x0_pred) / t_current
+                else:
+                    velocity = torch.zeros_like(x_t)
+            
+            # Euler step: x_{t+dt} = x_t + velocity * dt
+            x_t = x_t + velocity * dt 
+            if sde_sampling:
+                # x_t = x_t + self.config.sde_sigma * torch.randn_like(x_t)
+                x_t = x_t + sde_sigma[:, :, i, :] * torch.randn_like(x_t)
+            mdp_x_t_path[:, i] = x_t
+
+        # 缩放 action
+        actions = self.config.actor_scale * x_t
+        
+        # 如果已配置且处于训练模式，则添加探索噪声
+        if self.training and self.exploration_noise_std > 0:
+            noise = self.exploration_noise_std * torch.randn_like(actions)
+            actions = actions + noise
+
+        # 反归一化 action
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        return actions, mdp_x_t_path
+
+    def forward(self, batch: dict[str, Tensor], n_action_samples: int = 1, cfm_loss_t: Tensor = None, cfm_loss_eps: Tensor = None, debug=False, is_dppo: bool = False) -> tuple[Tensor, Tensor, Tensor]:
+        if is_dppo:
+            return self.forward_dppo(batch, debug)
+        else:
+            return self.forward_fpo(batch, n_action_samples, cfm_loss_t, cfm_loss_eps, debug)
+
+    def forward_dppo(self, batch: dict[str, Tensor], debug=False) -> tuple[Tensor, Tensor, Tensor]:
+        # 计算 denoising likelihood
+        # 归一化输入和目标
+        batch = self.normalize_inputs(batch)
+        batch = self.normalize_targets(batch)
+
+        # 获取 observation conditioning
+        obs_cond = self.model.encode_observations(batch)
+
+        # Concatenate the mdp_x_t_path and the action (x0)
+        x0 = batch[ACTION] 
+        mdp_x_t_path = batch["mdp_x_t_path"] # start from x1
+        B, T, D = x0.shape
+        assert mdp_x_t_path.shape == (B, T, self.config.sampling_steps, D), "mdp_x_t_path shape should be (B, T, flow sampling_steps, D)"
+
+        full_x_t_path = torch.cat([mdp_x_t_path, x0.unsqueeze(2)], dim=2)
+        assert full_x_t_path.shape == (B, T, self.config.sampling_steps + 1, D), "full_x_t_path shape should be (B, T, flow sampling_steps + 1, D)"
+
+        # 计算 the denoising likelihood
+        x_t = full_x_t_path[..., :-1, :]
+        x_t_next = full_x_t_path[..., 1:, :]
+        assert x_t.shape == (B, T, self.config.sampling_steps, D), "x_t shape should be (B, T, flow sampling_steps, D)"
+        assert x_t_next.shape == (B, T, self.config.sampling_steps, D), "x_t_next shape should be (B, T, flow sampling_steps, D)"
+
+        t_path = self.get_schedule(x_t.device) 
+        assert t_path.shape == (self.config.sampling_steps + 1,), "t_path shape should be (flow sampling_steps + 1,)"
+
+        flow_steps = self.config.sampling_steps
+        expected_x_t_next = torch.zeros((B, T, self.config.sampling_steps, D), device=x_t.device)
+        for i in range(flow_steps):
+            t_current = t_path[i]
+            t_next = t_path[i + 1]
+            dt = t_next - t_current  # Negative value since we go from 1 to 0
+            
+            timeembedding = self.model.diffusion_step_encoder(torch.tensor([t_current], device=x_t.device))
+            assert timeembedding.shape == (1, self.config.timestep_embed_dim)
+            timeembedding = timeembedding.expand(B, -1)
+
+            # 根据输出参数化方式进行预测
+            network_output = self.model(x_t[:, :, i, :], timeembedding, obs_cond)
+            network_output = self.config.mlp_output_scale * network_output
+
+            # 如果已配置则应用 clipping
+            if self.config.transported_clip_value is not None:
+                network_output = network_output.clamp(-self.config.transported_clip_value, self.config.transported_clip_value)
+            
+            if self.config.flow_network_output_param == "u":
+                # 直接预测速度
+                velocity = network_output
+            elif self.config.flow_network_output_param == "x0":
+                # x0 预测模式: 从 x0 计算速度
+                x0_pred = network_output
+
+                # 速度: u = (x_t - x0) / t for t > 0
+                if t_current > 1e-5:  # Avoid division by zero
+                    velocity = (x_t[:, :, i, :] - x0_pred) / t_current
+                else:
+                    velocity = torch.zeros_like(x_t)
+            
+            # Euler step: x_{t+dt} = x_t + velocity * dt
+            expected_x_t_next[:, :, i, :] = x_t[:, :, i, :] + dt * velocity
+
+        realized_noise = x_t_next - expected_x_t_next
+        assert realized_noise.shape == (B, T, self.config.sampling_steps, D), "realized_noise shape should be (B, T, flow sampling_steps, D)"
+
+        # 标准化实际噪声并计算 log probability
+        sde_sigma = self.get_sde_sigma(obs_cond, x_t.device)
+
+        if sde_sigma.shape == (self.config.sampling_steps,):
+            # 每个 flow step 使用固定 sigma: shape (sampling_steps,)
+            # 广播到 (1, 1, sampling_steps, 1) for division
+            sigma_expanded = sde_sigma[None, None, :, None]
+            standardized_noise = realized_noise / (sigma_expanded + 1e-6)
+
+            # Log probability: -0.5 * ||z||^2 - D/2 * log(2pi) - D * log(sigma)
+            # The last term accounts for the Jacobian of the transformation
+            log_prob = (
+                -0.5 * torch.sum(standardized_noise**2, dim=-1)
+                - D / 2 * torch.log(torch.tensor(2 * torch.pi, device=x_t.device))
+                - D * torch.log(sde_sigma + 1e-6)[None, None, :]
+            )
+            # 固定 sigma 时 entropy 为 0 (not learnable)
+            entropy = torch.tensor(0.0, device=x_t.device)
+
+        elif sde_sigma.shape == (B, T, 1, D):
+            # 学习得到的 sigma: shape (B, T, 1, D)
+            # Broadcasts across sampling_steps dimension
+            standardized_noise = realized_noise / (sde_sigma + 1e-6)
+
+            # Log probability: -0.5 * ||z||^2 - D/2 * log(2pi) - sum_d(log(sigma_d))
+            # Sum over action dimension D, the sigma is same across sampling_steps
+            log_sigma_sum = torch.sum(torch.log(sde_sigma + 1e-6), dim=-1)  # (B, T, 1)
+            log_prob = (
+                -0.5 * torch.sum(standardized_noise**2, dim=-1)
+                - D / 2 * torch.log(torch.tensor(2 * torch.pi, device=x_t.device))
+                - log_sigma_sum.squeeze(-1).unsqueeze(-1).expand(-1, -1, self.config.sampling_steps)
+            )
+
+            # 高斯分布的 entropy: 0.5 * D * (1 + log(2*pi)) + sum_d(log(sigma_d))
+            # Shape: (B, T, 1) -> squeeze to (B, T)
+            entropy = (
+                0.5 * D * (1 + torch.log(torch.tensor(2 * torch.pi, device=x_t.device)))
+                + log_sigma_sum.squeeze(-1)
+            )
+        else:
+            raise ValueError(
+                f"sde_sigma shape should be (sampling_steps,) or (B, T, 1, D), "
+                f"but got {sde_sigma.shape}"
+            )
+
+        assert log_prob.shape == (B, T, self.config.sampling_steps), \
+            f"log_prob shape should be (B, T, flow sampling_steps), but got {log_prob.shape}"
+
+        return log_prob, entropy, sde_sigma
+
+    def get_sde_sigma(self, obs_cond: Tensor, device: torch.device) -> Tensor:
+        """Get the SDE sigma for the flow matching.
+
+        Args:
+            obs_cond: Observation conditioning tensor of shape (B, obs_cond_dim)
+            device: Device to place the tensor on
+
+        Returns:
+            If learn_sde_sigma=False: Tensor of shape (sampling_steps,) with fixed sigma
+            If learn_sde_sigma=True: Tensor of shape (B, T, 1, D) from noise injection network
+                where T is horizon and D is action_dim. The singleton dimension broadcasts
+                across flow sampling steps.
+        """
+        if getattr(self.config, 'learn_sde_sigma', False):
+            if getattr(self, 'noise_injection_network', None) is None:
+                raise RuntimeError("Noise injection network not initialized. Call initialize_noise_injection_network() first.")
+            # obs_cond shape: (B, obs_cond_dim)
+            # Output shape: (B, T, 1, D) where T=horizon, D=action_dim
+            sde_sigma = self.noise_injection_network(obs_cond)
+            return sde_sigma
+        else:
+            return torch.ones((self.config.sampling_steps,), device=device) * self.config.sde_sigma
+
+    def initialize_noise_injection_network(self):
+        """Initialize the noise injection network.
+
+        Creates a NoiseInjectionNetwork that takes obs_cond as input and outputs
+        a tensor with shape (B, T, 1, D) where:
+            - B: batch size
+            - T: action horizon (chunk size)
+            - 1: singleton dimension for broadcasting across flow sampling steps
+            - D: action dimension
+        """
+        # 获取 observation conditioning dimension from the model
+        obs_cond_dim = self.model.global_cond_dim
+        action_dim = self.model.action_dim
+        horizon = self.config.horizon
+
+        min_noise = getattr(self.config, 'noise_injection_min', 0.2)
+        max_noise = getattr(self.config, 'noise_injection_max', 0.5)
+
+        self.noise_injection_network = NoiseInjectionNetwork(
+            obs_cond_dim=obs_cond_dim,
+            action_dim=action_dim,
+            horizon=horizon,
+            hidden_dims=[256, 256],
+            min_noise=min_noise,
+            max_noise=max_noise,
+        )
+
+    def forward_fpo(self, batch: dict[str, Tensor], n_action_samples: int = 1, cfm_loss_t: Tensor = None, cfm_loss_eps: Tensor = None, debug=False) -> tuple[Tensor, Tensor, Tensor]:
+        actions = batch[ACTION] # (num_envs, horizon, action_dim)
+        B, T, D = actions.shape
+        
+        if cfm_loss_t is None and cfm_loss_eps is None:
+            # 从 [0, 1] 均匀采样随机 timestep
+            cfm_loss_t = torch.rand((B * n_action_samples, 1, 1), device=actions.device)
+            # 采样噪声 (x1)
+            cfm_loss_eps = torch.randn((B * n_action_samples, T, D), device=actions.device)
+
+        if n_action_samples > 1:
+            # 复制 observation n_action_samples times
+            if self.config.image_features:
+                for img_key in self.config.image_features:
+                    if img_key in batch:
+                        img_tensor = batch[img_key]
+                        img_tensor_shape = img_tensor.shape
+                        if len(img_tensor_shape) == 5:
+                            img_tensor = img_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1, -1, -1)
+                            batch[img_key] = img_tensor.reshape(-1, *img_tensor_shape[1:])
+                        else:
+                            img_tensor = img_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1, -1)
+                            batch[img_key] = img_tensor.reshape(-1, *img_tensor_shape[1:])
+            if self.config.state_features:
+                for state_key in self.config.state_features:
+                    if state_key in batch:
+                        state_tensor = batch[state_key]
+                        state_tensor_shape = state_tensor.shape
+                        if len(state_tensor_shape) == 2:
+                            state_tensor = state_tensor.unsqueeze(1).expand(B, n_action_samples, -1)
+                            batch[state_key] = state_tensor.reshape(-1, *state_tensor_shape[1:])
+                        else:
+                            state_tensor = state_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1)
+                            batch[state_key] = state_tensor.reshape(-1, *state_tensor_shape[1:])
+
+            # 重塑 action in to (B * n_action_samples, T, D)
+            actions = actions.unsqueeze(1).expand(-1, n_action_samples, -1, -1).reshape(-1, T, D)
+            batch[ACTION] = actions
+
+        cfm_loss = self.get_cfm_loss(batch, cfm_loss_eps, cfm_loss_t, non_reduction=True)
+
+        # Reshape the cfm_loss, cfm_loss_t, cfm_loss_eps
+        cfm_loss = cfm_loss.mean(-1).transpose(0,1).reshape(T, B, n_action_samples) # (B * n_action_samples, T) -> (T,B*n_action_samples) -> (T,B,n_action_samples)
+        cfm_loss_t = cfm_loss_t.squeeze(-1).transpose(0,1).expand(T, -1).reshape(T, B, n_action_samples) # (B*n_action_samples, 1, 1) -> (T, B, n_action_samples)
+        cfm_loss_eps = cfm_loss_eps.permute(1, 0, 2).reshape(T, B, n_action_samples, D) # (B*n_action_samples, T, D) -> (T, B, n_action_samples, D)
+
+        return cfm_loss, cfm_loss_t, cfm_loss_eps
+
+    def get_cfm_loss(self, batch: dict[str, Tensor], cfm_loss_eps: Tensor = None, cfm_loss_t: Tensor = None, non_reduction: bool = False) -> tuple[Tensor, dict]:
+        """前向传播 for training with flow matching loss."""
+        # 归一化输入和目标
+        batch = self.normalize_inputs(batch)
+        batch = self.normalize_targets(batch)
+
+        # 获取 observation conditioning
+        obs_cond = self.model.encode_observations(batch)
+
+        # 获取 clean actions (x0)
+        actions = batch[ACTION]  # Shape: (B, T, D)
+        B, T, D = actions.shape
+
+        if cfm_loss_eps is None or cfm_loss_t is None:
+            # 从 [0, 1] 均匀采样随机 timestep
+            t = torch.rand((B, 1, 1), device=actions.device)
+            # 采样噪声 (x1)
+            noise = torch.randn_like(actions)
+        else:
+            t = cfm_loss_t
+            noise = cfm_loss_eps
+        
+        # Interpolate between x0 and x1: x_t = (1-t) * x0 + t * x1
+        x_t = (1 - t) * actions + t * noise
+        
+        # 根据输出参数化方式进行预测
+        timeembedding = self.model.diffusion_step_encoder(t)
+        timeembedding = timeembedding.reshape(B, -1)
+        network_output = self.model(x_t, timeembedding, obs_cond)
+        network_output = self.config.mlp_output_scale * network_output
+
+        # 如果已配置则应用 clipping
+        if self.config.transported_clip_value is not None:
+            network_output = network_output.clamp(-self.config.transported_clip_value, self.config.transported_clip_value)
+
+        # 根据模式计算 loss
+        if self.config.cfm_loss_mode == "x0":
+            # x0 MSE loss
+            if self.config.flow_network_output_param == "u":
+                # If network predicts velocity, compute x0 from it
+                velocity_pred = network_output
+                x0_pred = x_t - t * velocity_pred
+            else:  # flow_network_output_param == "x0"
+                x0_pred = network_output
+            
+            loss = self._compute_squared_error(x0_pred, actions)
+            
+        elif self.config.cfm_loss_mode == "u":
+            # 速度 MSE loss
+            target_velocity = noise - actions  # True flow velocity from x0 to x1
+            
+            if self.config.flow_network_output_param == "u":
+                velocity_pred = network_output
+            else:  # flow_network_output_param == "x0"
+                x0_pred = network_output
+                # 计算 velocity: u = (x_t - x0) / t
+                # Handle t=0 case
+                t_clamped = torch.clamp(t, min=1e-5)
+                velocity_pred = (x_t - x0_pred) / t_clamped
+            
+            loss = self._compute_squared_error(velocity_pred, target_velocity)
+            
+        elif self.config.cfm_loss_mode == "eps":
+            # Epsilon (x1) prediction loss
+            if self.config.flow_network_output_param == "u":
+                velocity_pred = network_output
+                x0_pred = x_t - t * velocity_pred
+                x1_pred = x0_pred + velocity_pred
+            else:  # flow_network_output_param == "x0"
+                x0_pred = network_output
+                # 计算 x1 from x0: x_t = (1-t)*x0 + t*x1 => x1 = (x_t - (1-t)*x0) / t
+                t_clamped = torch.clamp(t, min=1e-5)
+                x1_pred = (x_t - (1 - t) * x0_pred) / t_clamped
+            
+            loss = self._compute_squared_error(x1_pred, noise)
+        
+        # Apply timestep-dependent weighting
+        weight = self._compute_cfm_loss_weight(t)
+        loss = loss * weight
+        
+        if non_reduction:
+            return loss
+        
+        # 如果存在 padding mask 则处理它
+        if "action_is_pad" in batch:
+            mask = ~batch["action_is_pad"].unsqueeze(-1)
+            loss = (loss * mask).sum() / mask.sum()
+        else:
+            loss = loss.mean()
+
+        loss_dict = {"flow_loss": loss.item()}
+        return loss, loss_dict
+
+    def _compute_cfm_loss_weight(self, t: Tensor) -> Tensor:
+        """计算 timestep 相关权重 for CFM loss."""
+        # t has shape (B, 1, 1)
+        t_scalar = t.squeeze(-1).squeeze(-1)  # Shape: (B,)
+        
+        if self.config.cfm_loss_weight_from_t == "constant":
+            weight = torch.ones_like(t)
+        elif self.config.cfm_loss_weight_from_t == "linear_1_to_0.1":
+            # Weight goes from 1.0 at t=0 to 0.1 at t=1
+            weight = 1.0 - 0.9 * t
+        elif self.config.cfm_loss_weight_from_t == "linear_1_to_0.01":
+            # Weight goes from 1.0 at t=0 to 0.01 at t=1
+            weight = 1.0 - 0.99 * t
+        
+        return weight
+
+    def _compute_squared_error(
+        self, predictions: Tensor, targets: Tensor
+    ) -> torch.Tensor:
+        """计算平方误差 with optional Huber loss."""
+        if self.config.cfm_loss_use_huber:
+            # 修改版 Huber loss to match MSE when |error| <= delta
+            # L2 for |error| <= delta, linear for |error| > delta
+            diff = predictions - targets
+            abs_diff = torch.abs(diff)
+            huber_loss = torch.where(
+                abs_diff <= self.config.cfm_loss_huber_delta,
+                diff**2,  # No 0.5 factor, matches MSE
+                2 * self.config.cfm_loss_huber_delta * abs_diff - self.config.cfm_loss_huber_delta**2,
+            )
+            return huber_loss
+        else:
+            return F.mse_loss(predictions, targets, reduction="none")
+

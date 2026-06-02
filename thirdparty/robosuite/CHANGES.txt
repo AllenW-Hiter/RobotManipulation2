@@ -1,0 +1,5 @@
+This is a vendored copy of robosuite with no modifications.
+
+Upstream: https://github.com/ARISE-Initiative/robosuite
+Base commit: 75a4c9f4 (2025-08-04)
+License: MIT

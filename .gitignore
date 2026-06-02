@@ -1,0 +1,36 @@
+runs/
+.vscode
+.codex/
+.agents/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+thirdparty/miniconda3/
+thirdparty/dexmimicgen/
+thirdparty/lerobot/tests/artifacts/
+wandb/
+
+# Generated plots
+/*.pdf
+/*.png
+
+# Model checkpoints
+checkpoints/
+downloaded_checkpoints/*
+!downloaded_checkpoints/README.md
+
+# Downloaded W&B data
+far-wandb/
+
+# Evaluation artifacts
+threading_teaser/
+
+# Package build artifacts
+*.egg-info/
+
+# Environment files
+.env
+.env.*
+
+tmp_tobe_removed/
