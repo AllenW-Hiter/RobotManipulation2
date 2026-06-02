@@ -161,7 +161,7 @@ class FlowPPOConfig:
     # W&B
     wandb_enable: bool = True
     wandb_project: Optional[str] = "flow-bc-fpo-finetuning"
-    wandb_entity: str = "far-wandb"
+    wandb_entity: Optional[str] = None
     wandb_notes: Optional[str] = None
     wandb_continue_run_id: Optional[str] = None
     experiment: str = "finetune_fpo"
@@ -965,15 +965,20 @@ def main(cfg: FlowPPOConfig):
         wandb_run_id = cfg.wandb_continue_run_id if cfg.wandb_continue_run_id else None
         wandb_resume_mode = "must" if cfg.wandb_continue_run_id else None
         wandb_config = {**vars(cfg), "num_iterations": num_iterations, "batch_size": batch_size, "minibatch_size": minibatch_size}
+        wandb_init_kwargs = {
+            "project": cfg.wandb_project,
+            "config": wandb_config,
+            "name": f"{cfg.experiment}_{cfg.policy}_{cfg.task}",
+            "id": wandb_run_id,
+            "resume": wandb_resume_mode,
+            "dir": str(run_dir),
+            "settings": wandb.Settings(),
+        }
+        if cfg.wandb_entity:
+            wandb_init_kwargs["entity"] = cfg.wandb_entity
+        logger.info(f"W&B init entity: {cfg.wandb_entity or '<default logged-in entity>'}")
         wandb.init(
-            project=cfg.wandb_project,
-            entity=cfg.wandb_entity,
-            config=wandb_config,
-            name=f"{cfg.experiment}_{cfg.policy}_{cfg.task}",
-            id=wandb_run_id,
-            resume=wandb_resume_mode,
-            dir=str(run_dir),
-            settings=wandb.Settings(),
+            **wandb_init_kwargs,
         )
         logger.info(colored(f"W&B logging enabled (logs saved to {run_dir / 'wandb'})", "blue"))
 
