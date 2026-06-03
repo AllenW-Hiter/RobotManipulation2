@@ -40,8 +40,10 @@ from termcolor import colored
 
 
 from src.flow_model_config import FlowMatchingConfig
+from src.meanflow_model_config import MeanFlowConfig
 from src.dexmg_env import VectorizedEnvWrapper, create_vectorized_env
 from src.flow_model import FlowMatchingPolicy
+from src.meanflow_model import MeanFlowPolicy
 
 # 设置 multiprocessing start method for CUDA compatibility
 # This must be done before any other multiprocessing operations
@@ -88,7 +90,8 @@ class TrainFlowBCConfig:
     
     # Policy selection
     policy: Literal[
-        "flowmatching"
+        "flowmatching",
+        "meanflow",
     ] = "flowmatching"
     """Which policy architecture to train."""
     
@@ -128,7 +131,7 @@ class TrainFlowBCConfig:
     """Enable Weights & Biases logging."""
     wandb_project: Optional[str] = None
     """W&B project name (required when --wandb_enable)."""
-    wandb_entity: Optional[str] = "far-wandb"
+    wandb_entity: Optional[str] = None
     """W&B entity name."""
     experiment: Optional[str] = "train_flow_bc"
     """Experiment name."""
@@ -179,6 +182,26 @@ class TrainFlowBCConfig:
     """Use Huber loss instead of MSE loss."""
     cfm_loss_huber_delta: float = 0.5
     """Huber loss delta."""
+
+    # MeanFlow parameters
+    meanflow_flow_ratio: float = 0.5
+    """Fraction of MeanFlow samples with r=t for ordinary flow-matching consistency."""
+    meanflow_time_sampling: Literal["logit_normal_pair", "uniform_pair"] = "logit_normal_pair"
+    """Time-pair sampling distribution for MeanFlow BC."""
+    meanflow_logit_mu: float = -0.4
+    """MeanFlow logit-normal time-pair mean."""
+    meanflow_logit_sigma: float = 1.0
+    """MeanFlow logit-normal time-pair standard deviation."""
+    meanflow_use_adaptive_loss: bool = False
+    """Use adaptive MeanFlow L2 weighting."""
+    meanflow_adaptive_gamma: float = 0.5
+    """Adaptive MeanFlow loss gamma."""
+    meanflow_adaptive_c: float = 1e-3
+    """Adaptive MeanFlow loss stability constant."""
+    meanflow_separate_time_encoders: bool = False
+    """Use separate encoders for the two MeanFlow time inputs."""
+    meanflow_encode_t_minus_r: bool = False
+    """Encode t-r as the third MeanFlow time feature."""
 
 
     # Evaluation rollouts
@@ -643,31 +666,28 @@ def main(cfg: TrainFlowBCConfig):
     # before passing it on.
     
 
+    horizon = getattr(cfg, 'horizon', 16)
+    n_action_steps = getattr(cfg, 'n_action_steps', 8)
+    # Make sure n_action_steps is less than or equal to horizon.
+    if n_action_steps > horizon:
+        logger.warning(f"n_action_steps ({n_action_steps}) is greater than horizon ({horizon}), setting n_action_steps to horizon ({horizon})")
+        n_action_steps = horizon
+    sampling_steps = getattr(cfg, 'sampling_steps', 10)
+    vision_backbone = getattr(cfg, 'vision_backbone', "resnet18")
+    pretrained_backbone_weights = f"ResNet{vision_backbone.replace('resnet', '')}_Weights.IMAGENET1K_V1"
+    ema_power = getattr(cfg, 'ema_power', 0.0)
+    learning_rate = getattr(cfg, 'learning_rate', 0.0001)
+    lr_backbone = getattr(cfg, 'lr_backbone', 1e-05)
+    weight_decay = getattr(cfg, 'weight_decay', 1e-06)
+    flow_network_output_param = getattr(cfg, 'flow_network_output_param', "u")
+    cfm_loss_mode = getattr(cfg, 'cfm_loss_mode', "u")
+    transported_clip_value = getattr(cfg, 'transported_clip_value', None)
+    cfm_loss_use_huber = getattr(cfg, 'cfm_loss_use_huber', False)
+    cfm_loss_huber_delta = getattr(cfg, 'cfm_loss_huber_delta', 0.5)
+    network_architecture = getattr(cfg, 'network_architecture', "mlp")
+    mlp_dims = getattr(cfg, 'mlp_dims', None)
+
     if cfg.policy == "flowmatching":
-
-        horizon = getattr(cfg, 'horizon', 16)
-        n_action_steps = getattr(cfg, 'n_action_steps', 8)
-        # Make sure n_action_steps is less than or equal to horizon.
-        # assert n_action_steps <= horizon, f"n_action_steps ({n_action_steps}) must be less than or equal to horizon ({horizon})"
-        if n_action_steps > horizon:
-            logger.warning(f"n_action_steps ({n_action_steps}) is greater than horizon ({horizon}), setting n_action_steps to horizon ({horizon})")
-            n_action_steps = horizon
-        sampling_steps = getattr(cfg, 'sampling_steps', 10)
-        vision_backbone = getattr(cfg, 'vision_backbone', "resnet18")
-        pretrained_backbone_weights = f"ResNet{vision_backbone.replace('resnet', '')}_Weights.IMAGENET1K_V1"
-        ema_power = getattr(cfg, 'ema_power', 0.0)
-        learning_rate = getattr(cfg, 'learning_rate', 0.0001)
-        lr_backbone = getattr(cfg, 'lr_backbone', 1e-05)
-        weight_decay = getattr(cfg, 'weight_decay', 1e-06)
-        flow_network_output_param = getattr(cfg, 'flow_network_output_param', "u")  # or "u" for velocity
-        cfm_loss_mode = getattr(cfg, 'cfm_loss_mode', "u")  # or "u" or "eps"
-        transported_clip_value = getattr(cfg, 'transported_clip_value', None)
-        cfm_loss_use_huber = getattr(cfg, 'cfm_loss_use_huber', False)
-        cfm_loss_huber_delta = getattr(cfg, 'cfm_loss_huber_delta', 0.5)
-        network_architecture = getattr(cfg, 'network_architecture', "unet")
-        mlp_dims = getattr(cfg, 'mlp_dims', None)
-
-        # 创建 model configuration
         policy_cfg = FlowMatchingConfig(
             horizon=horizon,
             n_action_steps=n_action_steps,
@@ -686,7 +706,36 @@ def main(cfg: TrainFlowBCConfig):
             network_architecture=network_architecture,
             mlp_dims=mlp_dims if mlp_dims is not None else [512, 512, 512],
         )
-
+    elif cfg.policy == "meanflow":
+        if network_architecture != "mlp":
+            raise ValueError("MeanFlowPolicy BC currently supports only --network-architecture mlp")
+        policy_cfg = MeanFlowConfig(
+            horizon=horizon,
+            n_action_steps=n_action_steps,
+            sampling_steps=sampling_steps,
+            vision_backbone=vision_backbone,
+            pretrained_backbone_weights=pretrained_backbone_weights,
+            ema_power=ema_power,
+            optimizer_lr=learning_rate,
+            optimizer_lr_backbone=lr_backbone,
+            optimizer_weight_decay=weight_decay,
+            flow_network_output_param=flow_network_output_param,
+            cfm_loss_mode=cfm_loss_mode,
+            transported_clip_value=transported_clip_value,
+            cfm_loss_use_huber=cfm_loss_use_huber,
+            cfm_loss_huber_delta=cfm_loss_huber_delta,
+            network_architecture=network_architecture,
+            mlp_dims=mlp_dims if mlp_dims is not None else [512, 512, 512],
+            meanflow_flow_ratio=cfg.meanflow_flow_ratio,
+            meanflow_time_sampling=cfg.meanflow_time_sampling,
+            meanflow_logit_mu=cfg.meanflow_logit_mu,
+            meanflow_logit_sigma=cfg.meanflow_logit_sigma,
+            meanflow_use_adaptive_loss=cfg.meanflow_use_adaptive_loss,
+            meanflow_adaptive_gamma=cfg.meanflow_adaptive_gamma,
+            meanflow_adaptive_c=cfg.meanflow_adaptive_c,
+            meanflow_separate_time_encoders=cfg.meanflow_separate_time_encoders,
+            meanflow_encode_t_minus_r=cfg.meanflow_encode_t_minus_r,
+        )
     else:
         raise ValueError(f"Invalid policy: {cfg.policy}")
 
@@ -794,6 +843,8 @@ def main(cfg: TrainFlowBCConfig):
                 # Validate that project and entity are provided
                 if cfg.wandb_project is None:
                     raise ValueError("--wandb_project is required when resuming from W&B")
+                if cfg.wandb_entity is None:
+                    raise ValueError("--wandb_entity is required when resuming from W&B")
 
                 # Download checkpoint from wandb before initializing wandb
                 resume_checkpoint_path = download_checkpoint_from_wandb(
@@ -826,78 +877,93 @@ def main(cfg: TrainFlowBCConfig):
     # ---------------------------------------------------------------------
     # Policy configuration: 加载 from checkpoint or create new
     # ---------------------------------------------------------------------
+    policy_config_cls: type[FlowMatchingConfig] | type[MeanFlowConfig]
+    policy_cls: type[FlowMatchingPolicy] | type[MeanFlowPolicy]
     if cfg.policy == "flowmatching":
-        # If resuming from checkpoint, load the config from checkpoint
-        if resume_checkpoint_path is not None:
-            logger.info(colored("Loading policy config from checkpoint...", "cyan"))
-
-            config_path = resume_checkpoint_path / "policy" / "config.json"
-            if not config_path.exists():
-                raise ValueError(f"Config file not found in checkpoint: {config_path}")
-
-            with open(config_path, 'r') as f:
-                config_dict = json.load(f)
-                config_dict.pop('type', None)
-                config_dict.pop('normalization_mapping', None)
-                policy_cfg = FlowMatchingConfig(**config_dict)
-
-            logger.info(colored("Loaded policy config from checkpoint", "green"))
-
-            # 使用 image features from loaded config
-            if not hasattr(policy_cfg, '_image_features') or not policy_cfg._image_features:
-                # 设置 from input_features if not already set
-                policy_cfg.image_features = [k for k in policy_cfg.input_features if "image" in k]
-
-            # 更新 the config's image observation keys using the loaded config's image features
-            policy_cfg.image_observation_keys = [k.replace("observation.images.", "") for k in policy_cfg.image_features]
-
-            logger.info(f"Using image features from checkpoint config: {policy_cfg.image_features}")
-
-            # 设置 state features if not already set
-            if not hasattr(policy_cfg, '_state_features') or not policy_cfg._state_features:
-                policy_cfg.state_features = [k for k in policy_cfg.input_features if "state" in k or "pos" in k]
-            logger.info(f"State features: {policy_cfg.state_features}")
-
-        else:
-            # 创建 new config from scratch
-            logger.info(colored("Creating new policy config...", "cyan"))
-
-            # Configure input/output features
-            policy_cfg.input_features = list(dataset.features.keys())
-            policy_cfg.output_features = ["action"]
-            policy_cfg.input_shapes = ds_meta.shapes
-            policy_cfg.output_shapes = {"action": ds_meta.shapes["action"]}
-
-            # Determine image and state features
-            if cfg.image_observation_keys is not None:
-                # 使用 custom image observation keys (convert to policy format: observation.images.{key})
-                policy_cfg.image_features = [
-                    f"observation.images.{key.replace('_image', '')}" for key in cfg.image_observation_keys
-                ]
-                print(f"policy_cfg.input_features: {policy_cfg.input_features}")
-                print(f"cfg.image_observation_keys: {cfg.image_observation_keys}")
-                # Pop up image features that is not in use from policy_cfg.input_features
-                new_input_features = []
-                for policy_input_feature in policy_cfg.input_features:
-                    if "images" not in policy_input_feature:
-                        new_input_features.append(policy_input_feature)
-                    elif "images" in policy_input_feature and policy_input_feature in policy_cfg.image_features:
-                        new_input_features.append(policy_input_feature)
-                policy_cfg.input_features = new_input_features
-                logger.info(f"Using custom image observation keys: {policy_cfg.image_features}")
-            else:
-                # 使用 all image features from dataset
-                policy_cfg.image_features = [k for k in policy_cfg.input_features if "image" in k]
-                logger.info(f"Using all image features from dataset: {policy_cfg.image_features}")
-
-            policy_cfg.state_features = [k for k in policy_cfg.input_features if "state" in k or "pos" in k]
-
-        # 创建 model
-        logger.info("Creating FlowMatching model...")
-        policy = FlowMatchingPolicy(policy_cfg, dataset_stats=ds_meta.stats)
-
+        policy_config_cls = FlowMatchingConfig
+        policy_cls = FlowMatchingPolicy
+    elif cfg.policy == "meanflow":
+        policy_config_cls = MeanFlowConfig
+        policy_cls = MeanFlowPolicy
     else:
         raise ValueError(f"Invalid policy: {cfg.policy}")
+
+    # If resuming from checkpoint, load the config from checkpoint
+    if resume_checkpoint_path is not None:
+        logger.info(colored("Loading policy config from checkpoint...", "cyan"))
+
+        config_path = resume_checkpoint_path / "policy" / "config.json"
+        if not config_path.exists():
+            raise ValueError(f"Config file not found in checkpoint: {config_path}")
+
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+            checkpoint_policy_type = config_dict.pop('type', None)
+            config_dict.pop('normalization_mapping', None)
+            if checkpoint_policy_type is not None and checkpoint_policy_type != cfg.policy:
+                logger.warning(
+                    colored(
+                        f"Checkpoint policy type is {checkpoint_policy_type}, but CLI requested {cfg.policy}. "
+                        f"Using CLI policy class.",
+                        "yellow",
+                    )
+                )
+            policy_cfg = policy_config_cls(**config_dict)
+
+        logger.info(colored("Loaded policy config from checkpoint", "green"))
+
+        # 使用 image features from loaded config
+        if not hasattr(policy_cfg, '_image_features') or not policy_cfg._image_features:
+            # 设置 from input_features if not already set
+            policy_cfg.image_features = [k for k in policy_cfg.input_features if "image" in k]
+
+        # 更新 the config's image observation keys using the loaded config's image features
+        policy_cfg.image_observation_keys = [k.replace("observation.images.", "") for k in policy_cfg.image_features]
+
+        logger.info(f"Using image features from checkpoint config: {policy_cfg.image_features}")
+
+        # 设置 state features if not already set
+        if not hasattr(policy_cfg, '_state_features') or not policy_cfg._state_features:
+            policy_cfg.state_features = [k for k in policy_cfg.input_features if "state" in k or "pos" in k]
+        logger.info(f"State features: {policy_cfg.state_features}")
+
+    else:
+        # 创建 new config from scratch
+        logger.info(colored("Creating new policy config...", "cyan"))
+
+        # Configure input/output features
+        policy_cfg.input_features = list(dataset.features.keys())
+        policy_cfg.output_features = ["action"]
+        policy_cfg.input_shapes = ds_meta.shapes
+        policy_cfg.output_shapes = {"action": ds_meta.shapes["action"]}
+
+        # Determine image and state features
+        if cfg.image_observation_keys is not None:
+            # 使用 custom image observation keys (convert to policy format: observation.images.{key})
+            policy_cfg.image_features = [
+                f"observation.images.{key.replace('_image', '')}" for key in cfg.image_observation_keys
+            ]
+            print(f"policy_cfg.input_features: {policy_cfg.input_features}")
+            print(f"cfg.image_observation_keys: {cfg.image_observation_keys}")
+            # Pop up image features that is not in use from policy_cfg.input_features
+            new_input_features = []
+            for policy_input_feature in policy_cfg.input_features:
+                if "images" not in policy_input_feature:
+                    new_input_features.append(policy_input_feature)
+                elif "images" in policy_input_feature and policy_input_feature in policy_cfg.image_features:
+                    new_input_features.append(policy_input_feature)
+            policy_cfg.input_features = new_input_features
+            logger.info(f"Using custom image observation keys: {policy_cfg.image_features}")
+        else:
+            # 使用 all image features from dataset
+            policy_cfg.image_features = [k for k in policy_cfg.input_features if "image" in k]
+            logger.info(f"Using all image features from dataset: {policy_cfg.image_features}")
+
+        policy_cfg.state_features = [k for k in policy_cfg.input_features if "state" in k or "pos" in k]
+
+    # 创建 model
+    logger.info(f"Creating {cfg.policy} model...")
+    policy = policy_cls(policy_cfg, dataset_stats=ds_meta.stats)
 
     # Learning-rate & weight-decay fallbacks
     lr_default = getattr(policy_cfg, "optimizer_lr", 1e-4)
@@ -959,16 +1025,19 @@ def main(cfg: TrainFlowBCConfig):
             "total_frames": ds_meta.total_frames,
         }
 
-        wandb.init(
-            project=cfg.wandb_project,
-            entity=cfg.wandb_entity,
-            config=wandb_config,
-            name=f"{cfg.experiment}_{cfg.policy}_{Path(cfg.dataset).name}",
-            id=wandb_run_id,
-            resume=wandb_resume_mode,
-            dir=str(run_dir),  # 保存 wandb logs in the run directory
-            settings=wandb.Settings(),
-        )
+        wandb_init_kwargs = {
+            "project": cfg.wandb_project,
+            "config": wandb_config,
+            "name": f"{cfg.experiment}_{cfg.policy}_{Path(cfg.dataset).name}",
+            "id": wandb_run_id,
+            "resume": wandb_resume_mode,
+            "dir": str(run_dir),  # 保存 wandb logs in the run directory
+            "settings": wandb.Settings(),
+        }
+        if cfg.wandb_entity:
+            wandb_init_kwargs["entity"] = cfg.wandb_entity
+        logger.info(f"W&B init entity: {cfg.wandb_entity or '<default logged-in entity>'}")
+        wandb.init(**wandb_init_kwargs)
         logger.info(colored(f"W&B logging enabled (logs saved to {run_dir / 'wandb'})", "blue"))
 
     # ---------------------------------------------------------------------

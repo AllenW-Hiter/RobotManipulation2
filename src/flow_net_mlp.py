@@ -333,14 +333,15 @@ class MeanflowMLPModel(nn.Module):
         time_embed_dim = config.timestep_embed_dim
 
         # MLP 结构
-        # 输入: [noisy_action (action_dim * horizon), time_embedding x num_time_embed, observation_conditioning]
+        # 输入: [noisy_action, time_embedding(s), observation_conditioning]。
+        # MeanFlow 默认编码 [t, r]；开启 meanflow_encode_t_minus_r 时额外编码区间 [t, r, t-r]。
         if getattr(config, "meanflow_encode_t_minus_r", False):
-            self.meanflow_encode_t_minus_r=True
+            self.meanflow_encode_t_minus_r = True
             num_time_embed = 3
         else:
-            self.meanflow_encode_t_minus_r=False
+            self.meanflow_encode_t_minus_r = False
             num_time_embed = 2
-        input_dim = self.action_dim * config.horizon + time_embed_dim*num_time_embed + self.global_cond_dim
+        input_dim = self.action_dim * config.horizon + time_embed_dim * num_time_embed + self.global_cond_dim
 
         # 从配置获取 MLP 维度, default to [512, 512, 512]
         mlp_dims = getattr(config, 'mlp_dims', [512, 512, 512])
@@ -359,14 +360,15 @@ class MeanflowMLPModel(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-        # 时间步编码器（正弦位置编码）。默认 t 和 r/t-r 共享编码器。
+        # 时间步编码器（正弦位置编码）。默认 t、r、t-r 共享编码器；
+        # separate=True 时保留独立模块接口，便于后续替换为可学习编码器。
         if getattr(config, "meanflow_separate_time_encoders", False):
-            self.meanflow_separate_time_encoders=True
+            self.meanflow_separate_time_encoders = True
             self.time_t_encoder = SinusoidalPosEmb(time_embed_dim)
             self.time_r_encoder = SinusoidalPosEmb(time_embed_dim)
             self.time_t_minus_r_encoder = SinusoidalPosEmb(time_embed_dim)
         else:
-            self.meanflow_separate_time_encoders=False
+            self.meanflow_separate_time_encoders = False
             self.time_t_encoder = SinusoidalPosEmb(time_embed_dim)
             self.time_r_encoder = self.time_t_encoder
             self.time_t_minus_r_encoder = self.time_t_encoder
@@ -429,20 +431,23 @@ class MeanflowMLPModel(nn.Module):
             return self.vision_encoder.repr_dim
         return 512  # Default
     def encode_time_pair(self, t: Tensor, r: Tensor) -> Tensor:
-        """编码 MeanFlow 的时间对，返回拼接后的时间 embedding。"""
-        second_time = t - r if getattr(self.config, "meanflow_encode_t_minus_r", False) else r
+        """编码 MeanFlow 时间输入。
 
+        默认返回 [emb(t), emb(r)]；开启 meanflow_encode_t_minus_r 时返回
+        [emb(t), emb(r), emb(t-r)]。这里 t-r 是额外区间特征，不替换 r。
+        """
         t_flat = t.reshape(-1)
-        second_time_flat = second_time.reshape(-1)
+        r_flat = r.reshape(-1)
 
         t_emb = self.time_t_encoder(t_flat)
-        second_time_encoder = (
-            self.time_t_minus_r_encoder
-            if getattr(self.config, "meanflow_encode_t_minus_r", False)
-            else self.time_r_encoder
-        )
-        second_time_emb = second_time_encoder(second_time_flat)
-        return torch.cat([t_emb, second_time_emb], dim=-1)
+        r_emb = self.time_r_encoder(r_flat)
+
+        if not self.meanflow_encode_t_minus_r:
+            return torch.cat([t_emb, r_emb], dim=-1)
+
+        t_minus_r_flat = (t - r).reshape(-1)
+        t_minus_r_emb = self.time_t_minus_r_encoder(t_minus_r_flat)
+        return torch.cat([t_emb, r_emb, t_minus_r_emb], dim=-1)
 
     def encode_observations(self, batch: dict[str, Tensor]) -> Tensor:
         """将观测值编码到一个条件向量中"""

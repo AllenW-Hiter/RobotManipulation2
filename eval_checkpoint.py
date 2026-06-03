@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import json
 import imageio
@@ -23,6 +23,8 @@ from termcolor import colored
 from src.dexmg_env import VectorizedEnvWrapper, create_vectorized_env
 from src.flow_model import FlowMatchingPolicy
 from src.flow_model_config import FlowMatchingConfig
+from src.meanflow_model import MeanFlowPolicy
+from src.meanflow_model_config import MeanFlowConfig
 
 # 设置 multiprocessing start method for CUDA compatibility
 try:
@@ -51,7 +53,7 @@ class EvalCheckpointConfig:
     """WandB run ID to download checkpoint from."""
     wandb_project: Optional[str] = None
     """WandB project name (required when using wandb_run_id)."""
-    wandb_entity: str = "far-wandb"
+    wandb_entity: Optional[str] = None
     """WandB entity name."""
     checkpoint_step: Optional[str] = "latest"
     """Checkpoint step to evaluate. Can be 'latest', 'best', or a specific step number (e.g., 'step_3000')."""
@@ -65,6 +67,8 @@ class EvalCheckpointConfig:
     """Environment name for evaluation."""
     zero_sampling: bool = True
     """If True, use zero sampling for evaluation."""
+    override_sampling_steps: Optional[int] = None
+    """Override policy.config.sampling_steps after loading the checkpoint. Useful for inference-step ablations."""
     # image_observation_keys: Optional[str] = None # "agentview_image robot0_eye_in_hand_image"
     # """用于 policy 输入的图像 observation key (e.g., --image_observation_keys "robot0_eye_in_hand_image shouldercamera1_image"."""
     eval_num_episodes: int = 50
@@ -81,6 +85,12 @@ class EvalCheckpointConfig:
     """Device to use for evaluation."""
     debug: bool = False
     """Enable debug mode (uses synchronous vectorized environments)."""
+    env_vectorization: Literal["async", "sync"] = "async"
+    """Vectorized environment backend."""
+    async_env_context: Literal["spawn", "forkserver", "fork"] = "spawn"
+    """Multiprocessing context for AsyncVectorEnv."""
+    async_env_shared_memory: bool = True
+    """Whether AsyncVectorEnv uses shared memory for observations."""
     seed: Optional[int] = None
     """Random seed for reproducibility."""
 
@@ -135,7 +145,7 @@ def _annotate_frame(
 
 def _run_rollouts(
     *,
-    policy: FlowMatchingPolicy,
+    policy: FlowMatchingPolicy | MeanFlowPolicy,
     env: VectorizedEnvWrapper,
     save_dir: Path,
     step: str,
@@ -200,11 +210,13 @@ def _run_rollouts(
         for env_idx in range(num_parallel_envs):
             episode_returns[env_idx] += reward[env_idx].item()
 
+        for env_idx in range(num_parallel_envs):
+            episode_steps[env_idx] += 1
+
         if save_video:
             frames = env.render()
             for env_idx in range(num_parallel_envs):
                 episode_frames[env_idx].append(frames[env_idx])
-                episode_steps[env_idx] += 1
 
         total_steps += num_parallel_envs
         done = terminated | truncated
@@ -222,9 +234,10 @@ def _run_rollouts(
                 dones_list[env_idx].append(1)
                 successes_list[env_idx].append(int(is_success))
 
-                # discard the frames from the terminated environments since it is a new observation on the reseted new environment
-                episode_frames[env_idx].pop(-1)
-                episode_steps[env_idx] -= 1
+                # 丢弃终止环境 reset 后的新观测帧；未保存视频时没有帧需要处理。
+                if save_video and episode_frames[env_idx]:
+                    episode_frames[env_idx].pop(-1)
+                    episode_steps[env_idx] -= 1
 
                 # 记录每个 episode 的统计信息
                 all_episode_returns.append(episode_returns[env_idx])
@@ -390,7 +403,7 @@ def download_checkpoint_from_wandb(
     return Path(artifact_dir)
 
 
-def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = False) -> FlowMatchingPolicy:
+def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = False) -> FlowMatchingPolicy | MeanFlowPolicy:
     """从 checkpoint 目录加载 policy。
 
     Args:
@@ -417,9 +430,17 @@ def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = Fal
     logger.info(colored(f"Loading config from {config_path}...", "cyan"))
     with open(config_path, 'r') as f:
         config_dict = json.load(f)  # type: ignore
-        config_dict.pop('type')
-        config_dict.pop('normalization_mapping')
+        policy_type = config_dict.pop('type', "flowmatching")
+        config_dict.pop('normalization_mapping', None)
+
+    if policy_type == "flowmatching":
         config = FlowMatchingConfig(**config_dict)
+        policy_cls = FlowMatchingPolicy
+    elif policy_type == "meanflow":
+        config = MeanFlowConfig(**config_dict)
+        policy_cls = MeanFlowPolicy
+    else:
+        raise ValueError(f"Unsupported policy type in checkpoint config: {policy_type}")
 
     # 设置 image_features and state_features from input_features (similar to pretrain_flow_bc.py)
     config.image_features = [k for k in config.input_features if "image" in k]
@@ -428,11 +449,11 @@ def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = Fal
     logger.info(f"State features: {config.state_features}")
 
     # Construct the policy using the config (without dataset_stats for now)
-    logger.info(colored(f"Constructing FlowMatchingPolicy from config...", "cyan"))
+    logger.info(colored(f"Constructing {policy_type} policy from config...", "cyan"))
     # Signal to create ema model if load_ema is True
     if load_ema:
         config.ema_power = 1.0
-    policy = FlowMatchingPolicy(config, dataset_stats=None)
+    policy = policy_cls(config, dataset_stats=None)
 
     # 加载模型权重 from model.safetensors
     weights_path = policy_path / "model.safetensors"
@@ -502,6 +523,8 @@ def main(cfg: EvalCheckpointConfig):
     if cfg.wandb_run_id is not None:
         if cfg.wandb_project is None:
             raise ValueError("--wandb_project is required when using --wandb_run_id")
+        if cfg.wandb_entity is None:
+            raise ValueError("--wandb_entity is required when using --wandb_run_id")
 
         checkpoint_dir = download_checkpoint_from_wandb(
             run_id=cfg.wandb_run_id,
@@ -520,6 +543,19 @@ def main(cfg: EvalCheckpointConfig):
 
     # 加载 policy
     policy = load_policy(checkpoint_dir, device=cfg.device, load_ema=cfg.load_ema)
+    if cfg.override_sampling_steps is not None:
+        if cfg.override_sampling_steps < 1:
+            raise ValueError("--override_sampling_steps must be >= 1")
+        old_sampling_steps = policy.config.sampling_steps
+        policy.config.sampling_steps = cfg.override_sampling_steps
+        if hasattr(policy, "model") and hasattr(policy.model, "config"):
+            policy.model.config.sampling_steps = cfg.override_sampling_steps
+        logger.info(
+            colored(
+                f"Overrode policy sampling_steps: {old_sampling_steps} -> {cfg.override_sampling_steps}",
+                "yellow",
+            )
+        )
 
     # 创建评估环境
     logger.info(colored(f"Creating evaluation environment: {cfg.eval_env}", "cyan"))
@@ -537,6 +573,9 @@ def main(cfg: EvalCheckpointConfig):
         render_size=cfg.render_size,
         video_key=cfg.camera_name,
         debug=cfg.debug,
+        vectorization=cfg.env_vectorization,
+        async_context=cfg.async_env_context,
+        async_shared_memory=cfg.async_env_shared_memory,
         expected_image_keys=cfg.image_observation_keys,
         # expected_image_keys=["agentview_image"] # cfg.image_observation_keys,
     )
@@ -546,14 +585,17 @@ def main(cfg: EvalCheckpointConfig):
 
     # 初始化 wandb if enabled
     if cfg.wandb_enable:
-        wandb.init(
-            project=cfg.wandb_project or "checkpoint-evaluation",
-            entity=cfg.wandb_entity,
-            config=vars(cfg),
-            name=f"{cfg.experiment}_{cfg.eval_env}_{cfg.checkpoint_step}",
-            dir=str(run_dir),
-            settings=wandb.Settings(),
-        )
+        wandb_init_kwargs = {
+            "project": cfg.wandb_project or "checkpoint-evaluation",
+            "config": vars(cfg),
+            "name": f"{cfg.experiment}_{cfg.eval_env}_{cfg.checkpoint_step}",
+            "dir": str(run_dir),
+            "settings": wandb.Settings(),
+        }
+        if cfg.wandb_entity:
+            wandb_init_kwargs["entity"] = cfg.wandb_entity
+        logger.info(f"W&B init entity: {cfg.wandb_entity or '<default logged-in entity>'}")
+        wandb.init(**wandb_init_kwargs)
         logger.info(colored(f"W&B logging enabled", "blue"))
 
     # 运行评估

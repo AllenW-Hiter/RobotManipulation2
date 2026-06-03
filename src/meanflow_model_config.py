@@ -145,9 +145,9 @@ class MeanFlowConfig(PreTrainedConfig):
     meanflow_time_sampling: str = "logit_normal_pair"
     """时间对采样方式：'logit_normal_pair' 或 'uniform_pair'。"""
     meanflow_separate_time_encoders: bool = False
-    """是否为 t 和第二个时间输入分别使用独立时间编码器；False 表示共享同一个编码器。"""
+    """是否为 t、r、t-r 保留独立时间编码器模块；False 表示共享同一个编码器。"""
     meanflow_encode_t_minus_r: bool = False
-    """是否将第二个时间输入编码为 t-r；False 表示直接编码 r。"""
+    """是否额外加入区间编码 t-r；True 时 MeanFlow 时间特征为 [t, r, t-r]。"""
     meanflow_logit_mu: float = -0.4
     """logit-normal 采样的 mu 参数。"""
     meanflow_logit_sigma: float = 1.0

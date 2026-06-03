@@ -33,6 +33,8 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 from src.dexmg_env import VectorizedEnvWrapper, create_vectorized_env
 from src.flow_model import FlowMatchingPolicy
 from src.flow_model_config import FlowMatchingConfig
+from src.meanflow_model import MeanFlowPolicy
+from src.meanflow_model_config import MeanFlowConfig
 
 # ---- 多进程启动方式（CUDA 兼容） ---------------------------------------------
 try:
@@ -676,6 +678,7 @@ def main(cfg: FlowPPOConfig):
 
     # ------------- Rank-0 输入输出 -> 广播配置/权重 ----------------
     policy_config_payload: Dict[str, Any] | None = None
+    policy_type_payload: str | None = None
     state_dict_payload: Dict[str, Any] | None = None
     ema_state_payload: Dict[str, Any] | None = None
 
@@ -705,8 +708,15 @@ def main(cfg: FlowPPOConfig):
             raise ValueError(f"Config file not found: {config_path}")
         with open(config_path, "r") as f:
             config_dict = json.load(f)
-        # 清理 FlowMatchingConfig 不需要的字段
-        config_dict.pop("type", None)
+        policy_type_payload = config_dict.pop("type", "flowmatching")
+        if policy_type_payload not in {"flowmatching", "meanflow"}:
+            raise ValueError(f"Unsupported policy type in checkpoint: {policy_type_payload}")
+        if cfg.policy != policy_type_payload:
+            raise ValueError(
+                f"Checkpoint policy type is {policy_type_payload}, but CLI requested {cfg.policy}. "
+                f"Pass --policy {policy_type_payload} or use a matching checkpoint."
+            )
+        # 清理 PreTrainedConfig 序列化字段；normalization buffer 随权重加载。
         config_dict.pop("normalization_mapping", None)
         policy_config_payload = config_dict
 
@@ -723,13 +733,20 @@ def main(cfg: FlowPPOConfig):
 
     # 广播载荷
     if is_ddp:
-        obj = [policy_config_payload, state_dict_payload, ema_state_payload]
+        obj = [policy_config_payload, policy_type_payload, state_dict_payload, ema_state_payload]
         dist.broadcast_object_list(obj, src=0)
-        policy_config_payload, state_dict_payload, ema_state_payload = obj
+        policy_config_payload, policy_type_payload, state_dict_payload, ema_state_payload = obj
 
     # ---------- 在每个 rank 上一致地构建 actor/critic ----------
-    # 从载荷构造 FlowMatchingConfig
-    policy_config = FlowMatchingConfig(**policy_config_payload)  # type: ignore[arg-type]
+    if policy_type_payload == "flowmatching":
+        policy_config = FlowMatchingConfig(**policy_config_payload)  # type: ignore[arg-type]
+        policy_cls = FlowMatchingPolicy
+    elif policy_type_payload == "meanflow":
+        policy_config = MeanFlowConfig(**policy_config_payload)  # type: ignore[arg-type]
+        policy_cls = MeanFlowPolicy
+    else:
+        raise ValueError(f"Unsupported policy type: {policy_type_payload}")
+    cfg.policy = policy_type_payload
 
     # 从 input_features 派生特征（与预训练一致）
     policy_config.image_features = [k for k in policy_config.input_features if "image" in k]
@@ -742,8 +759,8 @@ def main(cfg: FlowPPOConfig):
     logger.info(f"[Rank {rank}] Using image features from checkpoint config: {policy_config.image_features}")
 
     # 实例化 actor
-    logger.info(colored(f"[Rank {rank}] Constructing FlowMatchingPolicy from config...", "cyan"))
-    actor = FlowMatchingPolicy(policy_config, dataset_stats=None)
+    logger.info(colored(f"[Rank {rank}] Constructing {policy_type_payload} policy from config...", "cyan"))
+    actor = policy_cls(policy_config, dataset_stats=None)
 
     # 从广播载荷加载权重
     actor.load_state_dict(state_dict_payload, strict=True)  # type: ignore[arg-type]
@@ -760,13 +777,28 @@ def main(cfg: FlowPPOConfig):
         logger.warning(colored("--load_ema flag set but no EMA weights found", "yellow"))
 
 
+    if cfg.policy == "meanflow":
+        if cfg.loss_mode != "fpo":
+            raise ValueError("MeanFlow online RL first stage only supports --loss_mode fpo.")
+        if cfg.rollout_granularity != "chunk":
+            raise ValueError("MeanFlow online RL first stage requires --rollout_granularity chunk.")
+        if cfg.learn_sde_sigma:
+            raise ValueError("MeanFlow online RL first stage does not support --learn_sde_sigma True.")
+        if not cfg.do_chunk_level_ppo:
+            raise ValueError("MeanFlow online RL first stage requires --do_chunk_level_ppo True.")
+
+
     # --------- 应用策略覆盖项（所有 rank 必须一致） ----
     def log_override(name, new, old):
         logger.info(f"[Rank {rank}] Overriding {name} to {new} from base policy {old}")
 
     if cfg.n_action_steps is not None:
-        # 仅在基础策略配置中未设置时覆盖
-        logger.warning(f"Only if you are training from scratch, otherwise you should use the same n_action_steps as the base policy ({actor.config.n_action_steps})")
+        logger.warning(
+            "Overriding n_action_steps changes the executed action chunk length. "
+            f"Base policy config has {actor.config.n_action_steps}; requested {cfg.n_action_steps}. "
+            "For chunk-level online RL, setting this to horizon is intentional when you want the "
+            "macro-action to cover the full predicted chunk."
+        )
         log_override("n_action_steps", cfg.n_action_steps, actor.config.n_action_steps)
         actor.config.n_action_steps = cfg.n_action_steps
     else:
@@ -809,9 +841,10 @@ def main(cfg: FlowPPOConfig):
                     f"from base policy {getattr(actor, 'exploration_noise_std', None)}")
         actor.exploration_noise_std = cfg.exploration_noise_std
 
-    if cfg.sde_sigma is not None:
+    if cfg.sde_sigma is not None and cfg.policy != "meanflow":
+        old_sde_sigma = getattr(actor.config, "sde_sigma", None)
         logger.info(f"[Rank {rank}] Overriding sde_sigma to {cfg.sde_sigma} in actor config "
-                    f"from base policy {getattr(actor, 'config.sde_sigma', None)}")
+                    f"from base policy {old_sde_sigma}")
         actor.config.sde_sigma = cfg.sde_sigma
     if cfg.learn_sde_sigma:
         logger.info(f"[Rank {rank}] Overriding learn_sde_sigma to {cfg.learn_sde_sigma} in actor config "
@@ -1001,6 +1034,7 @@ def main(cfg: FlowPPOConfig):
     values_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     cfm_losses_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_ts_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
+    cfm_loss_rs_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_epsilons_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples, action_dim))
     cfm_value_invalid_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     dppo_log_probs_stored = torch.zeros((steps_per_iteration, actor_module.config.sampling_steps, num_envs_per_process))
@@ -1014,11 +1048,35 @@ def main(cfg: FlowPPOConfig):
         for k in next_obs.keys() if k.startswith("observation.images.")
     }
 
-    def get_cfm_values(actor, obs, n_action_samples=1, cfm_loss_ts=None, cfm_loss_epsilons=None, debug=False):
+    def get_cfm_values(
+        actor,
+        obs,
+        n_action_samples=1,
+        cfm_loss_ts=None,
+        cfm_loss_rs=None,
+        cfm_loss_epsilons=None,
+        debug=False,
+    ):
+        actor_unwrapped = actor.module if hasattr(actor, "module") else actor
+        if isinstance(actor_unwrapped, MeanFlowPolicy):
+            cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = actor(
+                obs,
+                n_action_samples=n_action_samples,
+                cfm_loss_t=cfm_loss_ts,
+                cfm_loss_r=cfm_loss_rs,
+                cfm_loss_eps=cfm_loss_epsilons,
+                debug=debug,
+            )
+            return cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps
+
         cfm_loss, cfm_loss_t, cfm_loss_eps = actor(
-            obs, n_action_samples, cfm_loss_ts, cfm_loss_epsilons, debug=debug
+            obs,
+            n_action_samples=n_action_samples,
+            cfm_loss_t=cfm_loss_ts,
+            cfm_loss_eps=cfm_loss_epsilons,
+            debug=debug,
         )
-        return cfm_loss, cfm_loss_t, cfm_loss_eps
+        return cfm_loss, cfm_loss_t, None, cfm_loss_eps
 
     def get_log_prob_and_entropy(actor, obs):
         log_prob, entropy, sde_sigma = actor(obs, is_dppo=True)
@@ -1098,6 +1156,7 @@ def main(cfg: FlowPPOConfig):
                         device=action_chunks.device,
                     )
                     cfm_loss_t = torch.zeros_like(cfm_loss)
+                    cfm_loss_r = torch.zeros_like(cfm_loss)
                     cfm_loss_eps = torch.zeros(
                         (n_action_steps, num_envs_per_process, n_action_samples, action_dim),
                         device=action_chunks.device,
@@ -1105,7 +1164,7 @@ def main(cfg: FlowPPOConfig):
                     if cfg.loss_mode == "fpo":
                         obs_chunk_for_cfm = copy.deepcopy(obs_start)
                         obs_chunk_for_cfm["action"] = action_chunks
-                        cfm_loss, cfm_loss_t, cfm_loss_eps = get_cfm_values(
+                        cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_values(
                             actor,
                             obs_chunk_for_cfm,
                             n_action_samples,
@@ -1136,6 +1195,7 @@ def main(cfg: FlowPPOConfig):
                         mdp_x_t_paths_stored[storage_step] = mdp_x_t_path_chunk[:, action_idx].permute(1, 0, 2).cpu()
                         cfm_losses_stored[storage_step] = cfm_loss[action_idx].cpu()
                         cfm_loss_ts_stored[storage_step] = cfm_loss_t[action_idx].cpu()
+                        cfm_loss_rs_stored[storage_step] = cfm_loss_r[action_idx].cpu()
                         cfm_loss_epsilons_stored[storage_step] = cfm_loss_eps[action_idx].cpu()
                         dppo_log_probs_stored[storage_step] = dppo_log_prob[:, action_idx].permute(1, 0).cpu()
                         cfm_value_invalid_stored[storage_step] = 1.0 if invalid else 0.0
@@ -1272,11 +1332,13 @@ def main(cfg: FlowPPOConfig):
                 # curr_obs_chunk["action"] = actions_stored[step - horizon:step] 
                 
                 # 用于 FPO 微调
-                cfm_loss, cfm_loss_t, cfm_loss_eps = get_cfm_values(
+                cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_values(
                     actor, curr_obs_chunk, n_action_samples
                 )
                 cfm_losses_stored[step - action_idx:step] = cfm_loss.cpu()
                 cfm_loss_ts_stored[step - action_idx:step] = cfm_loss_t.cpu()
+                if cfm_loss_r is not None:
+                    cfm_loss_rs_stored[step - action_idx:step] = cfm_loss_r.cpu()
                 cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.cpu()
 
                 # 用于 DPPO 微调
@@ -1326,6 +1388,9 @@ def main(cfg: FlowPPOConfig):
 
         b_cfm_loss_ts = cfm_loss_ts_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples)
         b_cfm_loss_ts = b_cfm_loss_ts.permute(0, 2, 1, 3).reshape(-1, n_action_steps, n_action_samples)
+
+        b_cfm_loss_rs = cfm_loss_rs_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples)
+        b_cfm_loss_rs = b_cfm_loss_rs.permute(0, 2, 1, 3).reshape(-1, n_action_steps, n_action_samples)
 
         b_cfm_loss_epsilons = cfm_loss_epsilons_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples, action_dim)
         b_cfm_loss_epsilons = b_cfm_loss_epsilons.permute(0, 2, 1, 3, 4).reshape(-1, n_action_steps, n_action_samples, action_dim)
@@ -1420,6 +1485,7 @@ def main(cfg: FlowPPOConfig):
                 mb_actions = b_actions[mb_inds].to(device)
                 mb_cfm_losses = b_cfm_losses[mb_inds].to(device)
                 mb_cfm_loss_ts = b_cfm_loss_ts[mb_inds].to(device)
+                mb_cfm_loss_rs = b_cfm_loss_rs[mb_inds].to(device)
                 mb_cfm_loss_epsilons = b_cfm_loss_epsilons[mb_inds].to(device)
                 mb_dppo_log_probs = b_dppo_log_probs[mb_inds].to(device)
                 mb_mdp_x_t_paths = b_mdp_x_t_paths[mb_inds].to(device)
@@ -1453,13 +1519,25 @@ def main(cfg: FlowPPOConfig):
                     obs_chunk2["observation.state"] = mb_obs_state[:, 0]
                     obs_chunk2["action"] = mb_actions
 
-                    old_cfm_loss_ts = mb_cfm_loss_ts.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
-                    assert (old_cfm_loss_ts[:, 0, 0] == old_cfm_loss_ts[:, -1, 0]).all()
-                    old_cfm_loss_ts = old_cfm_loss_ts[:, 0:1, :]
+                    old_cfm_loss_ts_full = mb_cfm_loss_ts.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                    assert (old_cfm_loss_ts_full[:, 0, 0] == old_cfm_loss_ts_full[:, -1, 0]).all()
+                    old_cfm_loss_ts = old_cfm_loss_ts_full[:, 0:1, :]
                     old_cfm_loss_epsilons = mb_cfm_loss_epsilons.permute(0, 2, 1, 3).reshape(-1, n_action_steps, action_dim)
 
-                    curr_cfm_loss, _, _ = get_cfm_values(
-                        actor, obs_chunk2, n_action_samples, old_cfm_loss_ts, old_cfm_loss_epsilons
+                    if cfg.policy == "meanflow":
+                        old_cfm_loss_rs_full = mb_cfm_loss_rs.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                        assert (old_cfm_loss_rs_full[:, 0, 0] == old_cfm_loss_rs_full[:, -1, 0]).all()
+                        old_cfm_loss_rs = old_cfm_loss_rs_full[:, 0:1, :]
+                    else:
+                        old_cfm_loss_rs = None
+
+                    curr_cfm_loss, _, _, _ = get_cfm_values(
+                        actor,
+                        obs_chunk2,
+                        n_action_samples,
+                        cfm_loss_ts=old_cfm_loss_ts,
+                        cfm_loss_rs=old_cfm_loss_rs,
+                        cfm_loss_epsilons=old_cfm_loss_epsilons,
                     )
                     curr_cfm_loss = curr_cfm_loss.permute(1, 0, 2)
 
@@ -1550,7 +1628,7 @@ def main(cfg: FlowPPOConfig):
                     if is_ddp:
                         # 计算本地统计量
                         adv_mean = mb_advantages.mean()
-                        adv_std = mb_advantages.std()
+                        adv_std = mb_advantages.std(unbiased=False)
                         # 如果 adv_std 为 nan，则设为 0
                         if torch.isnan(adv_std):
                             adv_std = torch.tensor(0.0, device=device)
@@ -1561,7 +1639,7 @@ def main(cfg: FlowPPOConfig):
                         global_std = stats[1] / world_size
                         mb_advantages = (mb_advantages - global_mean) / (global_std + 1e-8)
                     else:
-                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std(unbiased=False) + 1e-8)
 
                 # 策略损失
                 if cfg.trust_region_mode == "spo":

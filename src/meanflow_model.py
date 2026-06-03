@@ -248,14 +248,7 @@ class MeanFlowPolicy(PreTrainedPolicy):
             # 构造批次级别的 t 和 r Tensor
             t_batch = torch.full((B,), t_current, device=x_t.device, dtype=x_t.dtype)
             r_batch = torch.full((B,), t_next, device=x_t.device, dtype=x_t.dtype)
-            t_emb = self.model.time_t_encoder(t_batch)
-            r_emb = self.model.time_r_encoder(r_batch)
-            if self.model.meanflow_encode_t_minus_r:
-                t_minus_r_emb=self.model.time_t_minus_r_encoder(t_batch-r_batch)
-                time_emb=torch.cat([t_emb,r_emb,t_minus_r_emb],dim=1)
-            else:
-                t_minus_r_emb=None
-                time_emb=torch.cat([t_emb,r_emb],dim=1)
+            time_emb = self.model.encode_time_pair(t_batch, r_batch)
             
             # 网络预测区间平均速度
             u = self.model.forward(x_t=x_t,t_emb=time_emb,obs_cond=obs_cond)
@@ -356,7 +349,14 @@ class MeanFlowPolicy(PreTrainedPolicy):
         if is_dppo:
             return self.forward_dppo(batch, debug)
         else:
-            return self.forward_fpo(batch, n_action_samples, cfm_loss_t,cfm_loss_r, cfm_loss_eps, debug)
+            return self.forward_fpo(
+                batch,
+                n_action_samples=n_action_samples,
+                cfm_loss_t=cfm_loss_t,
+                cfm_loss_eps=cfm_loss_eps,
+                cfm_loss_r=cfm_loss_r,
+                debug=debug,
+            )
     
     # 采样 (t, r) 时间对，满足 0 <= r <= t <= 1
     def _sample_meanflow_time_pair(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
@@ -424,21 +424,8 @@ class MeanFlowPolicy(PreTrainedPolicy):
         v = x_noise - x_data  # 从 data 到 noise 的速度方向
         
         # 定义网络函数用于 JVP 计算
-        def network_fn_2(z: Tensor, t_in: Tensor, r_in: Tensor) -> Tensor:
-            t_emb = self.model.time_t_encoder(t_in)
-            r_emb = self.model.time_r_encoder(r_in)
-            time_emb=torch.cat([t_emb,r_emb],dim=1)
-            output = self.model.forward(x_t=z, t_emb=time_emb, obs_cond=obs_cond)
-            output = self.config.mlp_output_scale * output
-            if self.config.transported_clip_value is not None:
-                output = output.clamp(-self.config.transported_clip_value,self.config.transported_clip_value,)
-            return output
-        
-        def network_fn_3(z: Tensor, t_in: Tensor, r_in: Tensor) -> Tensor:
-            t_emb = self.model.time_t_encoder(t_in)
-            r_emb = self.model.time_r_encoder(r_in)
-            t_minus_r_emb=self.model.time_t_minus_r_encoder(t_in-r_in)
-            time_emb=torch.cat([t_emb,r_emb,t_minus_r_emb],dim=1)
+        def network_fn(z: Tensor, t_in: Tensor, r_in: Tensor) -> Tensor:
+            time_emb = self.model.encode_time_pair(t_in, r_in)
             output = self.model.forward(x_t=z, t_emb=time_emb, obs_cond=obs_cond)
             output = self.config.mlp_output_scale * output
             if self.config.transported_clip_value is not None:
@@ -447,20 +434,12 @@ class MeanFlowPolicy(PreTrainedPolicy):
         
         # 使用 JVP 计算网络输出沿轨迹的导数 du_dt
         # tangent 对 (x_t, t, r) 分别为 (v, 1, 0)
-        if self.model.meanflow_encode_t_minus_r:
-            u, du_dt = torch.autograd.functional.jvp(
-                network_fn_3,
-                (x_t, t, r),
-                (v, torch.ones_like(t), torch.zeros_like(r)),
-                create_graph=True,
-            )
-        else:
-            u, du_dt = torch.autograd.functional.jvp(
-                network_fn_2,
-                (x_t, t, r),
-                (v, torch.ones_like(t), torch.zeros_like(r)),
-                create_graph=True,
-            )
+        u, du_dt = torch.autograd.functional.jvp(
+            network_fn,
+            (x_t, t, r),
+            (v, torch.ones_like(t), torch.zeros_like(r)),
+            create_graph=True,
+        )
         
         # MeanFlow 目标: v - (t - r) * du_dt
         target = v - (t_view - r_view) * du_dt
@@ -619,146 +598,22 @@ class MeanFlowPolicy(PreTrainedPolicy):
             max_noise=max_noise,
         )
 
-    def forward_fpo(self, batch: dict[str, Tensor], n_action_samples: int = 1, cfm_loss_t: Tensor = None, cfm_loss_eps: Tensor = None, debug=False) -> tuple[Tensor, Tensor, Tensor]:
-        actions = batch[ACTION] # (num_envs, horizon, action_dim)
-        B, T, D = actions.shape
-        
-        if cfm_loss_t is None and cfm_loss_eps is None:
-            # 从 [0, 1] 均匀采样随机 timestep
-            cfm_loss_t = torch.rand((B * n_action_samples, 1, 1), device=actions.device)
-            # 采样噪声 (x1)
-            cfm_loss_eps = torch.randn((B * n_action_samples, T, D), device=actions.device)
+    def get_cfm_loss(
+        self,
+        batch: dict[str, Tensor],
+        cfm_loss_eps: Tensor | None = None,
+        cfm_loss_t: Tensor | None = None,
+        non_reduction: bool = False,
+    ) -> tuple[Tensor, dict] | Tensor:
+        """兼容 BC 训练循环的 MeanFlow loss 入口。
 
-        if n_action_samples > 1:
-            # 复制 observation n_action_samples times
-            if self.config.image_features:
-                for img_key in self.config.image_features:
-                    if img_key in batch:
-                        img_tensor = batch[img_key]
-                        img_tensor_shape = img_tensor.shape
-                        if len(img_tensor_shape) == 5:
-                            img_tensor = img_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1, -1, -1)
-                            batch[img_key] = img_tensor.reshape(-1, *img_tensor_shape[1:])
-                        else:
-                            img_tensor = img_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1, -1)
-                            batch[img_key] = img_tensor.reshape(-1, *img_tensor_shape[1:])
-            if self.config.state_features:
-                for state_key in self.config.state_features:
-                    if state_key in batch:
-                        state_tensor = batch[state_key]
-                        state_tensor_shape = state_tensor.shape
-                        if len(state_tensor_shape) == 2:
-                            state_tensor = state_tensor.unsqueeze(1).expand(B, n_action_samples, -1)
-                            batch[state_key] = state_tensor.reshape(-1, *state_tensor_shape[1:])
-                        else:
-                            state_tensor = state_tensor.unsqueeze(1).expand(B, n_action_samples, -1, -1)
-                            batch[state_key] = state_tensor.reshape(-1, *state_tensor_shape[1:])
-
-            # 重塑 action in to (B * n_action_samples, T, D)
-            actions = actions.unsqueeze(1).expand(-1, n_action_samples, -1, -1).reshape(-1, T, D)
-            batch[ACTION] = actions
-
-        cfm_loss = self.get_cfm_loss(batch, cfm_loss_eps, cfm_loss_t, non_reduction=True)
-
-        # Reshape the cfm_loss, cfm_loss_t, cfm_loss_eps
-        cfm_loss = cfm_loss.mean(-1).transpose(0,1).reshape(T, B, n_action_samples) # (B * n_action_samples, T) -> (T,B*n_action_samples) -> (T,B,n_action_samples)
-        cfm_loss_t = cfm_loss_t.squeeze(-1).transpose(0,1).expand(T, -1).reshape(T, B, n_action_samples) # (B*n_action_samples, 1, 1) -> (T, B, n_action_samples)
-        cfm_loss_eps = cfm_loss_eps.permute(1, 0, 2).reshape(T, B, n_action_samples, D) # (B*n_action_samples, T, D) -> (T, B, n_action_samples, D)
-
-        return cfm_loss, cfm_loss_t, cfm_loss_eps
-
-    def get_cfm_loss(self, batch: dict[str, Tensor], cfm_loss_eps: Tensor = None, cfm_loss_t: Tensor = None, non_reduction: bool = False) -> tuple[Tensor, dict]:
-        """前向传播 for training with flow matching loss."""
-        # 归一化输入和目标
-        batch = self.normalize_inputs(batch)
-        batch = self.normalize_targets(batch)
-
-        # 获取 observation conditioning
-        obs_cond = self.model.encode_observations(batch)
-
-        # 获取 clean actions (x0)
-        actions = batch[ACTION]  # Shape: (B, T, D)
-        B, T, D = actions.shape
-
-        if cfm_loss_eps is None or cfm_loss_t is None:
-            # 从 [0, 1] 均匀采样随机 timestep
-            t = torch.rand((B, 1, 1), device=actions.device)
-            # 采样噪声 (x1)
-            noise = torch.randn_like(actions)
-        else:
-            t = cfm_loss_t
-            noise = cfm_loss_eps
-        
-        # Interpolate between x0 and x1: x_t = (1-t) * x0 + t * x1
-        x_t = (1 - t) * actions + t * noise
-        
-        # 根据输出参数化方式进行预测
-        timeembedding = self.model.diffusion_step_encoder(t)
-        timeembedding = timeembedding.reshape(B, -1)
-        network_output = self.model(x_t, timeembedding, obs_cond)
-        network_output = self.config.mlp_output_scale * network_output
-
-        # 如果已配置则应用 clipping
-        if self.config.transported_clip_value is not None:
-            network_output = network_output.clamp(-self.config.transported_clip_value, self.config.transported_clip_value)
-
-        # 根据模式计算 loss
-        if self.config.cfm_loss_mode == "x0":
-            # x0 MSE loss
-            if self.config.flow_network_output_param == "u":
-                # If network predicts velocity, compute x0 from it
-                velocity_pred = network_output
-                x0_pred = x_t - t * velocity_pred
-            else:  # flow_network_output_param == "x0"
-                x0_pred = network_output
-            
-            loss = self._compute_squared_error(x0_pred, actions)
-            
-        elif self.config.cfm_loss_mode == "u":
-            # 速度 MSE loss
-            target_velocity = noise - actions  # True flow velocity from x0 to x1
-            
-            if self.config.flow_network_output_param == "u":
-                velocity_pred = network_output
-            else:  # flow_network_output_param == "x0"
-                x0_pred = network_output
-                # 计算 velocity: u = (x_t - x0) / t
-                # Handle t=0 case
-                t_clamped = torch.clamp(t, min=1e-5)
-                velocity_pred = (x_t - x0_pred) / t_clamped
-            
-            loss = self._compute_squared_error(velocity_pred, target_velocity)
-            
-        elif self.config.cfm_loss_mode == "eps":
-            # Epsilon (x1) prediction loss
-            if self.config.flow_network_output_param == "u":
-                velocity_pred = network_output
-                x0_pred = x_t - t * velocity_pred
-                x1_pred = x0_pred + velocity_pred
-            else:  # flow_network_output_param == "x0"
-                x0_pred = network_output
-                # 计算 x1 from x0: x_t = (1-t)*x0 + t*x1 => x1 = (x_t - (1-t)*x0) / t
-                t_clamped = torch.clamp(t, min=1e-5)
-                x1_pred = (x_t - (1 - t) * x0_pred) / t_clamped
-            
-            loss = self._compute_squared_error(x1_pred, noise)
-        
-        # Apply timestep-dependent weighting
-        weight = self._compute_cfm_loss_weight(t)
-        loss = loss * weight
-        
-        if non_reduction:
-            return loss
-        
-        # 如果存在 padding mask 则处理它
-        if "action_is_pad" in batch:
-            mask = ~batch["action_is_pad"].unsqueeze(-1)
-            loss = (loss * mask).sum() / mask.sum()
-        else:
-            loss = loss.mean()
-
-        loss_dict = {"flow_loss": loss.item()}
-        return loss, loss_dict
+        `pretrain_flow_bc.py` 统一调用 `get_cfm_loss()`；MeanFlow 实际使用
+        `get_meanflow_loss()`，并且 replay loss 需要同时提供 eps/t/r。BC
+        训练不传 replay 张量，因此这里直接转发。
+        """
+        if cfm_loss_eps is not None or cfm_loss_t is not None:
+            raise ValueError("MeanFlow replay loss 需要 eps、t、r 三者；请直接调用 get_meanflow_loss()。")
+        return self.get_meanflow_loss(batch, non_reduction=non_reduction)
 
     def _compute_cfm_loss_weight(self, t: Tensor) -> Tensor:
         """计算 timestep 相关权重 for CFM loss."""
@@ -793,4 +648,3 @@ class MeanFlowPolicy(PreTrainedPolicy):
             return huber_loss
         else:
             return F.mse_loss(predictions, targets, reduction="none")
-
