@@ -100,6 +100,7 @@ class FlowPPOConfig:
     do_average_cfm_loss_in_chunk: bool = False
     n_action_samples: int = 16
     clamp_old_cfm_loss: Optional[float] = None
+    clamp_old_anchor_loss: Optional[float] = None
     cfm_loss_average_group_size: int = 1
     trust_region_mode: Literal["ppo", "spo", "aspo"] = "ppo"
     clamp_logratio: Optional[float] = None
@@ -117,6 +118,8 @@ class FlowPPOConfig:
     meanflow_bc_stage_loss_coef: float = 1.0
     meanflow_bc_stage_interval: int = 1
     meanflow_bc_stage_rollout_repeats: int = 1
+    meanflow_bc_stage_cache_mode: Literal["memory", "disk"] = "memory"
+    meanflow_bc_stage_cache_dir: Optional[str] = None
     meanflow_stage_sampling_mode: Literal["shared", "separate"] = "shared"
     meanflow_value_update_mode: Literal["joint", "first_rollout", "each_rollout"] = "joint"
     meanflow_stage_update_order: Literal["meanflow_first", "anchor_first"] = "meanflow_first"
@@ -803,6 +806,8 @@ def main(cfg: FlowPPOConfig):
             raise ValueError("--meanflow_anchor_logratio_coef must be positive.")
         if cfg.meanflow_anchor_sampling_steps <= 0:
             raise ValueError("--meanflow_anchor_sampling_steps must be positive.")
+        if cfg.clamp_old_anchor_loss is not None and cfg.clamp_old_anchor_loss <= 0:
+            raise ValueError("--clamp_old_anchor_loss must be positive when set.")
         if cfg.meanflow_bc_stage_epochs < 0:
             raise ValueError("--meanflow_bc_stage_epochs must be >= 0.")
         if cfg.meanflow_bc_stage_loss_coef < 0:
@@ -823,6 +828,8 @@ def main(cfg: FlowPPOConfig):
                 "--meanflow_bc_stage_rollout_repeats > 1 is only supported with "
                 "--meanflow_stage_sampling_mode separate and --meanflow_stage_update_order anchor_first."
             )
+        if cfg.meanflow_bc_stage_cache_dir is not None and cfg.meanflow_bc_stage_cache_mode != "disk":
+            raise ValueError("--meanflow_bc_stage_cache_dir is only used when --meanflow_bc_stage_cache_mode disk.")
     elif cfg.meanflow_fpo_loss_source != "cfm":
         raise ValueError("--meanflow_fpo_loss_source anchor is only valid for --policy meanflow.")
     elif cfg.meanflow_stage_sampling_mode != "shared":
@@ -831,10 +838,16 @@ def main(cfg: FlowPPOConfig):
         raise ValueError("--meanflow_value_update_mode is only valid for --policy meanflow.")
     elif cfg.meanflow_stage_update_order != "meanflow_first":
         raise ValueError("--meanflow_stage_update_order anchor_first is only valid for --policy meanflow.")
+    elif cfg.clamp_old_anchor_loss is not None:
+        raise ValueError("--clamp_old_anchor_loss is only valid for --policy meanflow.")
     elif cfg.meanflow_bc_stage_interval != 1:
         raise ValueError("--meanflow_bc_stage_interval is only valid for --policy meanflow.")
     elif cfg.meanflow_bc_stage_rollout_repeats != 1:
         raise ValueError("--meanflow_bc_stage_rollout_repeats is only valid for --policy meanflow.")
+    elif cfg.meanflow_bc_stage_cache_mode != "memory":
+        raise ValueError("--meanflow_bc_stage_cache_mode is only valid for --policy meanflow.")
+    elif cfg.meanflow_bc_stage_cache_dir is not None:
+        raise ValueError("--meanflow_bc_stage_cache_dir is only valid for --policy meanflow.")
 
 
     # --------- 应用策略覆盖项（所有 rank 必须一致） ----
@@ -1702,6 +1715,9 @@ def main(cfg: FlowPPOConfig):
         meanflow_bc_stage_selected_fraction = 0.0
         meanflow_bc_stage_updates = 0
         meanflow_bc_stage_rollout_batches = 0
+        meanflow_bc_stage_cached_samples = 0
+        old_anchor_loss_raw_agg = None
+        curr_anchor_loss_raw_agg = None
 
         def aggregate_sample_loss(loss_tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
             loss_tensor = loss_tensor.reshape(loss_tensor.shape[0], -1, n_groups, group_size)
@@ -1831,97 +1847,151 @@ def main(cfg: FlowPPOConfig):
             v_loss = run_value_update(first_stage_name)
             loss = v_loss
 
-        def run_meanflow_bc_stage() -> None:
+        def make_meanflow_bc_cache_ref(batch: Dict[str, Any], cache_name: str) -> Dict[str, Any] | Path:
+            nonlocal meanflow_bc_stage_rollout_batches, meanflow_bc_stage_cached_samples
+
+            cache = {
+                "actions": batch["b_actions"].detach().cpu().contiguous(),
+                "cfm_loss_ts": batch["b_cfm_loss_ts"].detach().cpu().contiguous(),
+                "cfm_loss_rs": batch["b_cfm_loss_rs"].detach().cpu().contiguous(),
+                "cfm_loss_epsilons": batch["b_cfm_loss_epsilons"].detach().cpu().contiguous(),
+                "cfm_value_invalid": batch["b_cfm_value_invalid"].detach().cpu().contiguous(),
+                "advantages": batch["b_advantages"].detach().cpu().contiguous(),
+                "obs_state": batch["b_obs_state"][:, 0].detach().cpu().contiguous(),
+                "obs_images": {
+                    k: v[:, 0].detach().cpu().contiguous()
+                    for k, v in batch["b_obs_images"].items()
+                },
+            }
+            meanflow_bc_stage_rollout_batches += 1
+            meanflow_bc_stage_cached_samples += int(cache["actions"].shape[0])
+
+            if cfg.meanflow_bc_stage_cache_mode == "disk":
+                cache_root = (
+                    Path(cfg.meanflow_bc_stage_cache_dir)
+                    if cfg.meanflow_bc_stage_cache_dir is not None
+                    else run_dir / "meanflow_bc_cache"
+                )
+                cache_root.mkdir(parents=True, exist_ok=True)
+                cache_path = cache_root / f"iter_{iteration:06d}_rank_{rank}_{cache_name}.pt"
+                torch.save(cache, cache_path)
+                return cache_path
+
+            return cache
+
+        def load_meanflow_bc_cache_ref(cache_ref: Dict[str, Any] | Path) -> Dict[str, Any]:
+            if isinstance(cache_ref, Path):
+                return torch.load(cache_ref, map_location="cpu")
+            return cache_ref
+
+        def cleanup_meanflow_bc_cache_refs(cache_refs: List[Dict[str, Any] | Path]) -> None:
+            for cache_ref in cache_refs:
+                if isinstance(cache_ref, Path):
+                    try:
+                        cache_ref.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning(f"Failed to remove MeanFlow BC cache file {cache_ref}: {exc}")
+
+        def run_meanflow_bc_stage(cache_refs: List[Dict[str, Any] | Path]) -> None:
             nonlocal actor_grad_norm_before, actor_grad_norm_after
             nonlocal meanflow_bc_stage_loss_value, meanflow_bc_stage_selected_fraction, meanflow_bc_stage_updates
-            nonlocal meanflow_bc_stage_rollout_batches
 
-            if not do_meanflow_bc_stage:
+            if not do_meanflow_bc_stage or not cache_refs:
                 return
 
             actor.train()
             if cfg.freeze_vision_encoder:
                 actor_module.model.vision_encoder.eval()
 
-            stage_batch_size = b_actions.shape[0]
-            if stage_batch_size <= 0:
-                return
-            meanflow_bc_stage_rollout_batches += 1
             stage_selected_fractions = []
             for stage_epoch in trange(
                 cfg.meanflow_bc_stage_epochs,
                 desc=f"[Rank {rank}] MeanFlow BC stage",
                 disable=(rank != 0),
             ):
-                stage_inds = np.arange(stage_batch_size)
-                np.random.shuffle(stage_inds)
-                optimizer_actor.zero_grad(set_to_none=True)
-
-                for start in range(0, stage_batch_size, minibatch_size):
-                    end = start + minibatch_size
-                    mb_inds = stage_inds[start:end]
-
-                    mb_actions_stage = b_actions[mb_inds].to(device)
-                    mb_cfm_loss_ts_stage = b_cfm_loss_ts[mb_inds].to(device)
-                    mb_cfm_loss_rs_stage = b_cfm_loss_rs[mb_inds].to(device)
-                    mb_cfm_loss_epsilons_stage = b_cfm_loss_epsilons[mb_inds].to(device)
-                    mb_cfm_value_invalid_stage = b_cfm_value_invalid[mb_inds].to(device)
-                    mb_advantages_stage = b_advantages[mb_inds].to(device)
-                    mb_obs_images_stage = {k: b_obs_images[k][mb_inds].to(device) for k in b_obs_images.keys()}
-                    mb_obs_state_stage = b_obs_state[mb_inds].to(device)
-
-                    stage_weights, selected_fraction = get_meanflow_bc_weights(mb_advantages_stage)
-                    stage_selected_fractions.append(selected_fraction)
-                    if stage_weights.sum().item() <= 0:
+                cache_order = list(range(len(cache_refs)))
+                random.shuffle(cache_order)
+                for cache_idx in cache_order:
+                    cache = load_meanflow_bc_cache_ref(cache_refs[cache_idx])
+                    stage_batch_size = cache["actions"].shape[0]
+                    if stage_batch_size <= 0:
                         continue
+                    stage_inds = np.arange(stage_batch_size)
+                    np.random.shuffle(stage_inds)
 
-                    valid_mask_stage = 1.0 - mb_cfm_value_invalid_stage
-                    obs_stage = {k: mb_obs_images_stage[k][:, 0] for k in mb_obs_images_stage.keys()}
-                    obs_stage["observation.state"] = mb_obs_state_stage[:, 0]
-                    obs_stage["action"] = mb_actions_stage
+                    for start in range(0, stage_batch_size, minibatch_size):
+                        end = start + minibatch_size
+                        mb_inds = stage_inds[start:end]
 
-                    old_t_stage_full = mb_cfm_loss_ts_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
-                    old_t_stage = old_t_stage_full[:, 0:1, :]
-                    old_r_stage_full = mb_cfm_loss_rs_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
-                    old_r_stage = old_r_stage_full[:, 0:1, :]
-                    old_eps_stage = mb_cfm_loss_epsilons_stage.permute(0, 2, 1, 3).reshape(-1, n_action_steps, action_dim)
+                        mb_actions_stage = cache["actions"][mb_inds].to(device)
+                        mb_cfm_loss_ts_stage = cache["cfm_loss_ts"][mb_inds].to(device)
+                        mb_cfm_loss_rs_stage = cache["cfm_loss_rs"][mb_inds].to(device)
+                        mb_cfm_loss_epsilons_stage = cache["cfm_loss_epsilons"][mb_inds].to(device)
+                        mb_cfm_value_invalid_stage = cache["cfm_value_invalid"][mb_inds].to(device)
+                        mb_advantages_stage = cache["advantages"][mb_inds].to(device)
+                        mb_obs_images_stage = {
+                            k: v[mb_inds].to(device)
+                            for k, v in cache["obs_images"].items()
+                        }
+                        mb_obs_state_stage = cache["obs_state"][mb_inds].to(device)
 
-                    curr_meanflow_loss_stage, _, _, _ = get_cfm_values(
-                        actor,
-                        obs_stage,
-                        n_action_samples,
-                        cfm_loss_ts=old_t_stage,
-                        cfm_loss_rs=old_r_stage,
-                        cfm_loss_epsilons=old_eps_stage,
-                    )
-                    curr_meanflow_loss_stage = curr_meanflow_loss_stage.permute(1, 0, 2)
-                    curr_meanflow_loss_stage = aggregate_sample_loss(
-                        curr_meanflow_loss_stage,
-                        valid_mask_stage,
-                    ).mean(dim=-1)
+                        stage_weights, selected_fraction = get_meanflow_bc_weights(mb_advantages_stage)
+                        stage_selected_fractions.append(selected_fraction)
+                        if stage_weights.sum().item() <= 0:
+                            continue
 
-                    stage_weights = stage_weights.to(curr_meanflow_loss_stage.device)
-                    stage_loss = (
-                        curr_meanflow_loss_stage * stage_weights
-                    ).sum() / stage_weights.sum().clamp_min(1.0)
-                    stage_loss = cfg.meanflow_bc_stage_loss_coef * stage_loss
-                    stage_loss.backward()
+                        valid_mask_stage = 1.0 - mb_cfm_value_invalid_stage
+                        obs_stage = {k: mb_obs_images_stage[k] for k in mb_obs_images_stage.keys()}
+                        obs_stage["observation.state"] = mb_obs_state_stage
+                        obs_stage["action"] = mb_actions_stage
 
-                    actor_grad_norm_before = nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
-                    actor_grad_norm_after = torch.nn.utils.clip_grad_norm_(actor.parameters(), float("inf"))
-                    optimizer_actor.step()
-                    if hasattr(actor_module, "step_ema"):
-                        actor_module.step_ema()
-                    optimizer_actor.zero_grad(set_to_none=True)
+                        old_t_stage_full = mb_cfm_loss_ts_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                        old_t_stage = old_t_stage_full[:, 0:1, :]
+                        old_r_stage_full = mb_cfm_loss_rs_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                        old_r_stage = old_r_stage_full[:, 0:1, :]
+                        old_eps_stage = mb_cfm_loss_epsilons_stage.permute(0, 2, 1, 3).reshape(-1, n_action_steps, action_dim)
 
-                    meanflow_bc_stage_loss_value = float(stage_loss.detach().item())
-                    meanflow_bc_stage_updates += 1
+                        curr_meanflow_loss_stage, _, _, _ = get_cfm_values(
+                            actor,
+                            obs_stage,
+                            n_action_samples,
+                            cfm_loss_ts=old_t_stage,
+                            cfm_loss_rs=old_r_stage,
+                            cfm_loss_epsilons=old_eps_stage,
+                        )
+                        curr_meanflow_loss_stage = curr_meanflow_loss_stage.permute(1, 0, 2)
+                        curr_meanflow_loss_stage = aggregate_sample_loss(
+                            curr_meanflow_loss_stage,
+                            valid_mask_stage,
+                        ).mean(dim=-1)
+
+                        stage_weights = stage_weights.to(curr_meanflow_loss_stage.device)
+                        stage_loss = (
+                            curr_meanflow_loss_stage * stage_weights
+                        ).sum() / stage_weights.sum().clamp_min(1.0)
+                        stage_loss = cfg.meanflow_bc_stage_loss_coef * stage_loss
+
+                        optimizer_actor.zero_grad(set_to_none=True)
+                        stage_loss.backward()
+                        actor_grad_norm_before = nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+                        actor_grad_norm_after = torch.nn.utils.clip_grad_norm_(actor.parameters(), float("inf"))
+                        optimizer_actor.step()
+                        if hasattr(actor_module, "step_ema"):
+                            actor_module.step_ema()
+
+                        meanflow_bc_stage_loss_value = float(stage_loss.detach().item())
+                        meanflow_bc_stage_updates += 1
+
+                    if isinstance(cache_refs[cache_idx], Path):
+                        del cache
 
             if stage_selected_fractions:
                 meanflow_bc_stage_selected_fraction = float(np.mean(stage_selected_fractions))
 
         if meanflow_first:
-            run_meanflow_bc_stage()
+            bc_cache_refs = [make_meanflow_bc_cache_ref(active_batch, "meanflow_first")]
+            run_meanflow_bc_stage(bc_cache_refs)
+            cleanup_meanflow_bc_cache_refs(bc_cache_refs)
 
         if use_separate_stage_sampling and meanflow_first:
             active_batch = collect_rollout_batch("stage_b", reset_env_for_rollout=cfg.reset_every_iteration)
@@ -2054,19 +2124,25 @@ def main(cfg: FlowPPOConfig):
                             mb_meanflow_anchor_losses.shape[0], -1, n_groups, group_size
                         )
                         curr_anchor_loss = curr_anchor_loss.reshape(curr_anchor_loss.shape[0], -1, n_groups, group_size)
+                        old_anchor_loss_raw = old_anchor_loss
+                        curr_anchor_loss_raw = curr_anchor_loss
                     else:
                         old_anchor_loss = None
+                        old_anchor_loss_raw = None
+                        curr_anchor_loss_raw = None
 
                     if cfg.clamp_old_cfm_loss is not None:
                         # old_cfm_loss = torch.clamp(old_cfm_loss, max=cfg.clamp_old_cfm_loss)
                         old_cfm_loss = clamp_ste(old_cfm_loss, max=cfg.clamp_old_cfm_loss)
-                        if old_anchor_loss is not None:
-                            old_anchor_loss = clamp_ste(old_anchor_loss, max=cfg.clamp_old_cfm_loss)
+                    if old_anchor_loss is not None and cfg.clamp_old_anchor_loss is not None:
+                        old_anchor_loss = clamp_ste(old_anchor_loss, max=cfg.clamp_old_anchor_loss)
 
                     if cfg.do_chunk_level_ppo:
                         old_cfm_loss = aggregate_sample_loss(old_cfm_loss, valid_idx_mask_in_chunk)
                         curr_cfm_loss = aggregate_sample_loss(curr_cfm_loss, valid_idx_mask_in_chunk)
                         if cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor":
+                            old_anchor_loss_raw_agg = aggregate_sample_loss(old_anchor_loss_raw, valid_idx_mask_in_chunk)
+                            curr_anchor_loss_raw_agg = aggregate_sample_loss(curr_anchor_loss_raw, valid_idx_mask_in_chunk)
                             old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
                             curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
                             logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
@@ -2083,6 +2159,8 @@ def main(cfg: FlowPPOConfig):
                         old_cfm_loss = aggregate_sample_loss(old_cfm_loss, valid_idx_mask_in_chunk)
                         curr_cfm_loss = aggregate_sample_loss(curr_cfm_loss, valid_idx_mask_in_chunk)
                         if cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor":
+                            old_anchor_loss_raw_agg = aggregate_sample_loss(old_anchor_loss_raw, valid_idx_mask_in_chunk)
+                            curr_anchor_loss_raw_agg = aggregate_sample_loss(curr_anchor_loss_raw, valid_idx_mask_in_chunk)
                             old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
                             curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
                             logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
@@ -2252,48 +2330,55 @@ def main(cfg: FlowPPOConfig):
 
         if do_meanflow_bc_stage and not meanflow_first:
             bc_stage_rollout_repeats = cfg.meanflow_bc_stage_rollout_repeats if use_separate_stage_sampling else 1
+            bc_cache_refs: List[Dict[str, Any] | Path] = []
             for bc_stage_rollout_idx in range(bc_stage_rollout_repeats):
                 if use_separate_stage_sampling:
-                    stage_a_name = "stage_a"
+                    stage_a_name = "bc_cache_rollout"
                     if bc_stage_rollout_repeats > 1:
-                        stage_a_name = f"stage_a_bc_{bc_stage_rollout_idx + 1}_of_{bc_stage_rollout_repeats}"
-                    active_batch = collect_rollout_batch(stage_a_name, reset_env_for_rollout=cfg.reset_every_iteration)
-                    (
-                        b_actions,
-                        b_cfm_losses,
-                        b_meanflow_anchor_losses,
-                        b_cfm_loss_ts,
-                        b_cfm_loss_rs,
-                        b_cfm_loss_epsilons,
-                        b_dppo_log_probs,
-                        b_mdp_x_t_paths,
-                        b_cfm_value_invalid,
-                        b_values,
-                        b_dones,
-                        b_rewards,
-                        b_chunk_rewards,
-                        b_chunk_discounts,
-                        b_chunk_dones,
-                        b_chunk_valid_lengths,
-                        b_obs_images,
-                        b_obs_state,
-                        b_advantages,
-                        b_returns,
-                    ) = unpack_rollout_batch(active_batch)
-                    total_successes_global += active_batch["successes_global"]
-                    total_episodes_global += active_batch["episodes_global"]
+                        stage_a_name = f"bc_cache_rollout_{bc_stage_rollout_idx + 1}_of_{bc_stage_rollout_repeats}"
+                    bc_rollout_batch = collect_rollout_batch(stage_a_name, reset_env_for_rollout=cfg.reset_every_iteration)
+                    bc_cache_refs.append(make_meanflow_bc_cache_ref(bc_rollout_batch, stage_a_name))
+                    total_successes_global += bc_rollout_batch["successes_global"]
+                    total_episodes_global += bc_rollout_batch["episodes_global"]
                     success_rate_global = (
                         total_successes_global / total_episodes_global if total_episodes_global > 0 else 0.0
                     )
-                    sps_steps += active_batch["sps_steps"]
+                    sps_steps += bc_rollout_batch["sps_steps"]
                     sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
-                    b_inds = np.arange(b_actions.shape[0])
 
                     if meanflow_preupdate_value and cfg.meanflow_value_update_mode == "each_rollout":
+                        (
+                            b_actions,
+                            b_cfm_losses,
+                            b_meanflow_anchor_losses,
+                            b_cfm_loss_ts,
+                            b_cfm_loss_rs,
+                            b_cfm_loss_epsilons,
+                            b_dppo_log_probs,
+                            b_mdp_x_t_paths,
+                            b_cfm_value_invalid,
+                            b_values,
+                            b_dones,
+                            b_rewards,
+                            b_chunk_rewards,
+                            b_chunk_discounts,
+                            b_chunk_dones,
+                            b_chunk_valid_lengths,
+                            b_obs_images,
+                            b_obs_state,
+                            b_advantages,
+                            b_returns,
+                        ) = unpack_rollout_batch(bc_rollout_batch)
+                        b_inds = np.arange(b_actions.shape[0])
                         v_loss = run_value_update(stage_a_name)
                         loss = v_loss
+                else:
+                    bc_cache_refs.append(make_meanflow_bc_cache_ref(active_batch, "shared_anchor_first"))
 
-                run_meanflow_bc_stage()
+            try:
+                run_meanflow_bc_stage(bc_cache_refs)
+            finally:
+                cleanup_meanflow_bc_cache_refs(bc_cache_refs)
 
         # 指标（rank 本地）
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -2321,16 +2406,51 @@ def main(cfg: FlowPPOConfig):
                 "cfm/curr_cfm_loss_hist": wandb.Histogram(curr_cfm_loss.detach().cpu().numpy().flatten()),
             }
             if cfg.policy == "meanflow" and old_anchor_loss is not None and curr_anchor_loss is not None:
+                anchor_metrics = {
+                    "meanflow_anchor/old_loss_mean": float(old_anchor_loss.mean().item()),
+                    "meanflow_anchor/old_loss_std": float(old_anchor_loss.std().item()),
+                    "meanflow_anchor/curr_loss_mean": float(curr_anchor_loss.mean().item()),
+                    "meanflow_anchor/curr_loss_std": float(curr_anchor_loss.std().item()),
+                    "meanflow_anchor/delta_mean": float((old_anchor_loss - curr_anchor_loss).mean().item()),
+                    "meanflow_anchor/delta_std": float((old_anchor_loss - curr_anchor_loss).std().item()),
+                    "meanflow_anchor/logratio_coef": float(cfg.meanflow_anchor_logratio_coef),
+                    "meanflow_anchor/sampling_mode": 1.0 if cfg.meanflow_anchor_sampling_mode == "schedule" else 0.0,
+                    "meanflow_anchor/sampling_steps": float(cfg.meanflow_anchor_sampling_steps),
+                    "meanflow_anchor/old_clamp": float(cfg.clamp_old_anchor_loss or 0.0),
+                }
+                if old_anchor_loss_raw_agg is not None and curr_anchor_loss_raw_agg is not None:
+                    raw_delta = old_anchor_loss_raw_agg - curr_anchor_loss_raw_agg
+                    anchor_metrics.update(
+                        {
+                            "meanflow_anchor/raw_old_loss_mean": float(old_anchor_loss_raw_agg.mean().item()),
+                            "meanflow_anchor/raw_old_loss_std": float(old_anchor_loss_raw_agg.std().item()),
+                            "meanflow_anchor/raw_curr_loss_mean": float(curr_anchor_loss_raw_agg.mean().item()),
+                            "meanflow_anchor/raw_curr_loss_std": float(curr_anchor_loss_raw_agg.std().item()),
+                            "meanflow_anchor/raw_delta_mean": float(raw_delta.mean().item()),
+                            "meanflow_anchor/raw_delta_std": float(raw_delta.std().item()),
+                        }
+                    )
+                    if cfg.clamp_old_anchor_loss is not None:
+                        anchor_metrics["meanflow_anchor/raw_old_clamped_fraction"] = float(
+                            (old_anchor_loss_raw_agg > cfg.clamp_old_anchor_loss).float().mean().item()
+                        )
+
+                adv_for_metrics = mb_advantages.detach()
+                logratio_for_metrics = logratio.detach()
+                if adv_for_metrics.shape != logratio_for_metrics.shape:
+                    adv_for_metrics = adv_for_metrics.expand_as(logratio_for_metrics)
+                pos_mask = adv_for_metrics > 0
+                neg_mask = adv_for_metrics < 0
+                if pos_mask.any():
+                    anchor_metrics["meanflow_anchor/logratio_pos_adv_mean"] = float(
+                        logratio_for_metrics[pos_mask].mean().item()
+                    )
+                if neg_mask.any():
+                    anchor_metrics["meanflow_anchor/logratio_neg_adv_mean"] = float(
+                        logratio_for_metrics[neg_mask].mean().item()
+                    )
                 cfm_metrics.update(
-                    {
-                        "meanflow_anchor/old_loss_mean": float(old_anchor_loss.mean().item()),
-                        "meanflow_anchor/old_loss_std": float(old_anchor_loss.std().item()),
-                        "meanflow_anchor/curr_loss_mean": float(curr_anchor_loss.mean().item()),
-                        "meanflow_anchor/curr_loss_std": float(curr_anchor_loss.std().item()),
-                        "meanflow_anchor/logratio_coef": float(cfg.meanflow_anchor_logratio_coef),
-                        "meanflow_anchor/sampling_mode": 1.0 if cfg.meanflow_anchor_sampling_mode == "schedule" else 0.0,
-                        "meanflow_anchor/sampling_steps": float(cfg.meanflow_anchor_sampling_steps),
-                    }
+                    anchor_metrics
                 )
             if cfg.policy == "meanflow":
                 cfm_metrics.update(
@@ -2346,6 +2466,8 @@ def main(cfg: FlowPPOConfig):
                         "meanflow_bc_stage/interval": float(cfg.meanflow_bc_stage_interval),
                         "meanflow_bc_stage/rollout_repeats": float(cfg.meanflow_bc_stage_rollout_repeats),
                         "meanflow_bc_stage/rollout_batches": float(meanflow_bc_stage_rollout_batches),
+                        "meanflow_bc_stage/cached_samples": float(meanflow_bc_stage_cached_samples),
+                        "meanflow_bc_stage/cache_mode": 1.0 if cfg.meanflow_bc_stage_cache_mode == "disk" else 0.0,
                         "meanflow_bc_stage/loss": float(meanflow_bc_stage_loss_value),
                         "meanflow_bc_stage/selected_fraction": float(meanflow_bc_stage_selected_fraction),
                         "meanflow_bc_stage/updates": float(meanflow_bc_stage_updates),
