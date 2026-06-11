@@ -108,10 +108,12 @@ class FlowPPOConfig:
     exploration_noise_std: Optional[float] = None
     zero_sampling: bool = True  # 已废弃；现在评估时同时使用 zero 和 non-zero sampling
     save_non_zero_sampling_video: bool = False
-    meanflow_fpo_loss_source: Literal["cfm", "anchor"] = "cfm"
+    meanflow_fpo_loss_source: Literal["cfm", "anchor", "trajectory"] = "cfm"
     meanflow_anchor_logratio_coef: float = 1.0
     meanflow_anchor_sampling_mode: Literal["random", "schedule"] = "random"
     meanflow_anchor_sampling_steps: int = 1
+    meanflow_trajectory_logp_sigma: float = 1.0
+    meanflow_trajectory_probe_noise_std: float = 0.1
     meanflow_bc_stage_epochs: int = 0
     meanflow_bc_stage_selection: Literal["advantage", "success", "success_or_top"] = "advantage"
     meanflow_bc_stage_top_fraction: Optional[float] = None
@@ -807,6 +809,12 @@ def main(cfg: FlowPPOConfig):
             raise ValueError("--meanflow_anchor_logratio_coef must be positive.")
         if cfg.meanflow_anchor_sampling_steps <= 0:
             raise ValueError("--meanflow_anchor_sampling_steps must be positive.")
+        if cfg.meanflow_trajectory_logp_sigma <= 0:
+            raise ValueError("--meanflow_trajectory_logp_sigma must be positive.")
+        if cfg.meanflow_trajectory_probe_noise_std < 0:
+            raise ValueError("--meanflow_trajectory_probe_noise_std must be >= 0.")
+        if cfg.meanflow_fpo_loss_source == "trajectory" and cfg.n_action_samples <= 1:
+            raise ValueError("--meanflow_fpo_loss_source trajectory requires --n_action_samples > 1.")
         if cfg.clamp_old_anchor_loss is not None and cfg.clamp_old_anchor_loss <= 0:
             raise ValueError("--clamp_old_anchor_loss must be positive when set.")
         if cfg.meanflow_bc_stage_epochs < 0:
@@ -832,7 +840,7 @@ def main(cfg: FlowPPOConfig):
         if cfg.meanflow_bc_stage_cache_dir is not None and cfg.meanflow_bc_stage_cache_mode != "disk":
             raise ValueError("--meanflow_bc_stage_cache_dir is only used when --meanflow_bc_stage_cache_mode disk.")
     elif cfg.meanflow_fpo_loss_source != "cfm":
-        raise ValueError("--meanflow_fpo_loss_source anchor is only valid for --policy meanflow.")
+        raise ValueError("--meanflow_fpo_loss_source anchor/trajectory is only valid for --policy meanflow.")
     elif cfg.meanflow_stage_sampling_mode != "shared":
         raise ValueError("--meanflow_stage_sampling_mode separate is only valid for --policy meanflow.")
     elif cfg.meanflow_value_update_mode != "joint":
@@ -1113,6 +1121,10 @@ def main(cfg: FlowPPOConfig):
     cfm_loss_ts_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_rs_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_epsilons_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples, action_dim))
+    meanflow_traj_probe_noises_stored = torch.zeros(
+        (steps_per_iteration, num_envs_per_process, n_action_samples, action_dim)
+    )
+    meanflow_traj_logps_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     cfm_value_invalid_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     dppo_log_probs_stored = torch.zeros((steps_per_iteration, actor_module.config.sampling_steps, num_envs_per_process))
 
@@ -1193,6 +1205,64 @@ def main(cfg: FlowPPOConfig):
 
         return log_prob, entropy, sde_sigma
 
+    def build_meanflow_trajectory_probe_noises(init_noise: torch.Tensor) -> torch.Tensor:
+        """围绕 rollout 初始噪声构造 trajectory KDE probes。
+
+        返回形状为 (B, T, n_action_samples, D)。第 0 个 probe 始终是
+        实际 rollout 使用的初始噪声，其余 probe 是局部高斯扰动。
+        """
+        probes = init_noise.unsqueeze(2).expand(
+            init_noise.shape[0],
+            init_noise.shape[1],
+            n_action_samples,
+            init_noise.shape[2],
+        ).clone()
+        if n_action_samples > 1 and cfg.meanflow_trajectory_probe_noise_std > 0:
+            probes[:, :, 1:, :] = probes[:, :, 1:, :] + (
+                cfg.meanflow_trajectory_probe_noise_std * torch.randn_like(probes[:, :, 1:, :])
+            )
+        return probes
+
+    def get_meanflow_trajectory_logp(
+        actor_like,
+        obs: Dict[str, torch.Tensor],
+        actions: torch.Tensor,
+        probe_noises: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """计算高斯核平滑后的 implicit trajectory logp surrogate。
+
+        actions 为环境尺度 action；probe_noises 为归一化采样空间中的初始噪声。
+        返回形状为 (B, 1)，可直接和 chunk-level advantage 对齐。
+        """
+        actor_unwrapped = actor_like.module if hasattr(actor_like, "module") else actor_like
+        if not isinstance(actor_unwrapped, MeanFlowPolicy):
+            raise ValueError("Trajectory logp surrogate is only implemented for MeanFlowPolicy.")
+
+        B, T, D = actions.shape
+        M = probe_noises.shape[2]
+        obs_repeated = {}
+        for key, value in obs.items():
+            obs_repeated[key] = value.unsqueeze(1).expand(B, M, *value.shape[1:]).reshape(B * M, *value.shape[1:])
+
+        probe_flat = probe_noises.permute(0, 2, 1, 3).reshape(B * M, T, D)
+        pred_actions = actor_unwrapped.rollout_normalized_action_from_noise(obs_repeated, probe_flat)
+        pred_actions = pred_actions[:, :T, :].reshape(B, M, T, D)
+
+        target_actions = actor_unwrapped.normalize_targets({"action": actions})["action"]
+        diff = pred_actions - target_actions.unsqueeze(1)
+        per_step_mse = diff.square().mean(dim=-1)
+
+        if valid_mask is None:
+            energy = per_step_mse.mean(dim=-1)
+        else:
+            valid = valid_mask.to(device=per_step_mse.device, dtype=per_step_mse.dtype).unsqueeze(1)
+            denom = valid.sum(dim=-1).clamp_min(1.0)
+            energy = (per_step_mse * valid).sum(dim=-1) / denom
+
+        energy = energy / (2.0 * cfg.meanflow_trajectory_logp_sigma ** 2)
+        return torch.logsumexp(-energy, dim=1, keepdim=True) - math.log(M)
+
     def get_action_and_value(actor_module, critic, obs, sde_sampling: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         obs_copy = copy.deepcopy(obs)
         action, mdp_x_t_path = actor_module.select_action(obs, sde_sampling=sde_sampling)
@@ -1221,6 +1291,8 @@ def main(cfg: FlowPPOConfig):
             cfm_loss_ts_stored,
             cfm_loss_rs_stored,
             cfm_loss_epsilons_stored,
+            meanflow_traj_probe_noises_stored,
+            meanflow_traj_logps_stored,
             cfm_value_invalid_stored,
             dppo_log_probs_stored,
         ):
@@ -1268,13 +1340,34 @@ def main(cfg: FlowPPOConfig):
                     chunk_values_stored[chunk_idx] = value_start.cpu()
 
                     sde_sampling = cfg.loss_mode == "dppo"
-                    action_chunks, mdp_x_t_path = actor_module.predict_action_chunk(
-                        obs_start,
-                        sde_sampling=sde_sampling,
+                    use_meanflow_trajectory = (
+                        cfg.policy == "meanflow"
+                        and cfg.meanflow_fpo_loss_source == "trajectory"
                     )
+                    if use_meanflow_trajectory:
+                        action_chunks, mdp_x_t_path, init_noise = actor_module.predict_action_chunk(
+                            obs_start,
+                            sde_sampling=sde_sampling,
+                            return_init_noise=True,
+                        )
+                    else:
+                        action_chunks, mdp_x_t_path = actor_module.predict_action_chunk(
+                            obs_start,
+                            sde_sampling=sde_sampling,
+                        )
+                        init_noise = None
                     action_chunks = action_chunks[:, :n_action_steps, :]
                     mdp_x_t_path = mdp_x_t_path[:, :, :n_action_steps, :]
                     mdp_x_t_path_chunk = mdp_x_t_path.permute(0, 2, 1, 3)
+                    if init_noise is not None:
+                        init_noise = init_noise[:, :n_action_steps, :]
+                        meanflow_traj_probe_noises = build_meanflow_trajectory_probe_noises(init_noise)
+                    else:
+                        meanflow_traj_probe_noises = torch.zeros(
+                            (num_envs_per_process, n_action_steps, n_action_samples, action_dim),
+                            device=action_chunks.device,
+                            dtype=action_chunks.dtype,
+                        )
                     assert action_chunks.shape == (num_envs_per_process, n_action_steps, action_dim)
                     assert mdp_x_t_path_chunk.shape == (
                         num_envs_per_process,
@@ -1333,6 +1426,9 @@ def main(cfg: FlowPPOConfig):
                         cfm_loss_ts_stored[storage_step] = cfm_loss_t[action_idx].detach().cpu()
                         cfm_loss_rs_stored[storage_step] = cfm_loss_r[action_idx].detach().cpu()
                         cfm_loss_epsilons_stored[storage_step] = cfm_loss_eps[action_idx].detach().cpu()
+                        meanflow_traj_probe_noises_stored[storage_step] = (
+                            meanflow_traj_probe_noises[:, action_idx].detach().cpu()
+                        )
                         dppo_log_probs_stored[storage_step] = dppo_log_prob[:, action_idx].permute(1, 0).detach().cpu()
                         cfm_value_invalid_stored[storage_step] = 1.0 if invalid else 0.0
 
@@ -1376,6 +1472,18 @@ def main(cfg: FlowPPOConfig):
                         store_chunk_slot(storage_step, next_obs, pad_idx, invalid=True)
                         rewards_stored[storage_step] = 0.0
                         dones_stored[storage_step] = chunk_done
+
+                    if use_meanflow_trajectory:
+                        old_traj_logp = get_meanflow_trajectory_logp(
+                            actor,
+                            obs_start,
+                            action_chunks,
+                            meanflow_traj_probe_noises,
+                            valid_action_mask,
+                        )
+                        for traj_idx in range(n_action_steps):
+                            storage_step = chunk_start_step + traj_idx
+                            meanflow_traj_logps_stored[storage_step] = old_traj_logp.squeeze(-1).detach().cpu()
 
                     chunk_reward, chunk_discount, valid_lengths = compute_chunk_reward_and_discount(
                         inner_rewards,
@@ -1545,6 +1653,16 @@ def main(cfg: FlowPPOConfig):
         b_cfm_loss_epsilons = cfm_loss_epsilons_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples, action_dim)
         b_cfm_loss_epsilons = b_cfm_loss_epsilons.permute(0, 2, 1, 3, 4).reshape(-1, n_action_steps, n_action_samples, action_dim)
 
+        b_meanflow_traj_probe_noises = meanflow_traj_probe_noises_stored.reshape(
+            -1, n_action_steps, num_envs_per_process, n_action_samples, action_dim
+        )
+        b_meanflow_traj_probe_noises = b_meanflow_traj_probe_noises.permute(
+            0, 2, 1, 3, 4
+        ).reshape(-1, n_action_steps, n_action_samples, action_dim)
+
+        b_meanflow_traj_logps = meanflow_traj_logps_stored.reshape(-1, n_action_steps, num_envs_per_process)
+        b_meanflow_traj_logps = b_meanflow_traj_logps.permute(0, 2, 1).reshape(-1, n_action_steps)
+
         b_dppo_log_probs = dppo_log_probs_stored.reshape(-1, n_action_steps, actor_module.config.sampling_steps, num_envs_per_process)
         b_dppo_log_probs = b_dppo_log_probs.permute(0, 3, 1, 2).reshape(-1, n_action_steps, actor_module.config.sampling_steps)
 
@@ -1620,6 +1738,8 @@ def main(cfg: FlowPPOConfig):
             "b_cfm_loss_ts": b_cfm_loss_ts,
             "b_cfm_loss_rs": b_cfm_loss_rs,
             "b_cfm_loss_epsilons": b_cfm_loss_epsilons,
+            "b_meanflow_traj_probe_noises": b_meanflow_traj_probe_noises,
+            "b_meanflow_traj_logps": b_meanflow_traj_logps,
             "b_dppo_log_probs": b_dppo_log_probs,
             "b_mdp_x_t_paths": b_mdp_x_t_paths,
             "b_cfm_value_invalid": b_cfm_value_invalid,
@@ -1681,6 +1801,8 @@ def main(cfg: FlowPPOConfig):
                 batch["b_cfm_loss_ts"],
                 batch["b_cfm_loss_rs"],
                 batch["b_cfm_loss_epsilons"],
+                batch["b_meanflow_traj_probe_noises"],
+                batch["b_meanflow_traj_logps"],
                 batch["b_dppo_log_probs"],
                 batch["b_mdp_x_t_paths"],
                 batch["b_cfm_value_invalid"],
@@ -1705,6 +1827,8 @@ def main(cfg: FlowPPOConfig):
             b_cfm_loss_ts,
             b_cfm_loss_rs,
             b_cfm_loss_epsilons,
+            b_meanflow_traj_probe_noises,
+            b_meanflow_traj_logps,
             b_dppo_log_probs,
             b_mdp_x_t_paths,
             b_cfm_value_invalid,
@@ -1748,6 +1872,9 @@ def main(cfg: FlowPPOConfig):
         meanflow_bc_stage_success_cached_samples = 0
         old_anchor_loss_raw_agg = None
         curr_anchor_loss_raw_agg = None
+        old_traj_logp = None
+        curr_traj_logp = None
+        traj_logratio = None
 
         def aggregate_sample_loss(loss_tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
             loss_tensor = loss_tensor.reshape(loss_tensor.shape[0], -1, n_groups, group_size)
@@ -2051,6 +2178,8 @@ def main(cfg: FlowPPOConfig):
                 b_cfm_loss_ts,
                 b_cfm_loss_rs,
                 b_cfm_loss_epsilons,
+                b_meanflow_traj_probe_noises,
+                b_meanflow_traj_logps,
                 b_dppo_log_probs,
                 b_mdp_x_t_paths,
                 b_cfm_value_invalid,
@@ -2098,6 +2227,8 @@ def main(cfg: FlowPPOConfig):
                 mb_cfm_loss_ts = b_cfm_loss_ts[mb_inds].to(device)
                 mb_cfm_loss_rs = b_cfm_loss_rs[mb_inds].to(device)
                 mb_cfm_loss_epsilons = b_cfm_loss_epsilons[mb_inds].to(device)
+                mb_meanflow_traj_probe_noises = b_meanflow_traj_probe_noises[mb_inds].to(device)
+                mb_meanflow_traj_logps = b_meanflow_traj_logps[mb_inds].to(device)
                 mb_dppo_log_probs = b_dppo_log_probs[mb_inds].to(device)
                 mb_mdp_x_t_paths = b_mdp_x_t_paths[mb_inds].to(device)
                 mb_cfm_value_invalid = b_cfm_value_invalid[mb_inds].to(device)
@@ -2196,6 +2327,18 @@ def main(cfg: FlowPPOConfig):
                             old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
                             curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
                             logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
+                        elif cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "trajectory":
+                            obs_traj = {k: v for k, v in obs_chunk2.items() if k != "action"}
+                            old_traj_logp = mb_meanflow_traj_logps[:, 0:1]
+                            curr_traj_logp = get_meanflow_trajectory_logp(
+                                actor,
+                                obs_traj,
+                                mb_actions,
+                                mb_meanflow_traj_probe_noises,
+                                valid_idx_mask_in_chunk,
+                            )
+                            traj_logratio = curr_traj_logp - old_traj_logp
+                            logratio = traj_logratio
                         else:
                             logratio = old_cfm_loss - curr_cfm_loss
 
@@ -2214,6 +2357,18 @@ def main(cfg: FlowPPOConfig):
                             old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
                             curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
                             logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
+                        elif cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "trajectory":
+                            obs_traj = {k: v for k, v in obs_chunk2.items() if k != "action"}
+                            old_traj_logp = mb_meanflow_traj_logps[:, 0:1]
+                            curr_traj_logp = get_meanflow_trajectory_logp(
+                                actor,
+                                obs_traj,
+                                mb_actions,
+                                mb_meanflow_traj_probe_noises,
+                                valid_idx_mask_in_chunk,
+                            )
+                            traj_logratio = curr_traj_logp - old_traj_logp
+                            logratio = traj_logratio
                         else:
                             logratio = old_cfm_loss - curr_cfm_loss
 
@@ -2404,6 +2559,8 @@ def main(cfg: FlowPPOConfig):
                             b_cfm_loss_ts,
                             b_cfm_loss_rs,
                             b_cfm_loss_epsilons,
+                            b_meanflow_traj_probe_noises,
+                            b_meanflow_traj_logps,
                             b_dppo_log_probs,
                             b_mdp_x_t_paths,
                             b_cfm_value_invalid,
@@ -2439,8 +2596,13 @@ def main(cfg: FlowPPOConfig):
 
         # 跟踪 CFM/DPPO 指标用于日志（使用最后一个 minibatch 值作为代表）
         if cfg.loss_mode == "fpo":
+            ratio_loss_source_id = 0.0
+            if cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor":
+                ratio_loss_source_id = 1.0
+            elif cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "trajectory":
+                ratio_loss_source_id = 2.0
             cfm_metrics = {
-                "cfm/ratio_loss_source": 1.0 if (cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor") else 0.0,
+                "cfm/ratio_loss_source": ratio_loss_source_id,
                 "cfm/old_cfm_loss_mean": float(old_cfm_loss.mean().item()),
                 "cfm/old_cfm_loss_std": float(old_cfm_loss.std().item()),
                 "cfm/curr_cfm_loss_mean": float(curr_cfm_loss.mean().item()),
@@ -2503,6 +2665,38 @@ def main(cfg: FlowPPOConfig):
                 cfm_metrics.update(
                     anchor_metrics
                 )
+            if (
+                cfg.policy == "meanflow"
+                and cfg.meanflow_fpo_loss_source == "trajectory"
+                and old_traj_logp is not None
+                and curr_traj_logp is not None
+            ):
+                traj_metrics = {
+                    "meanflow_trajectory/old_logp_mean": float(old_traj_logp.mean().item()),
+                    "meanflow_trajectory/old_logp_std": float(old_traj_logp.std().item()),
+                    "meanflow_trajectory/curr_logp_mean": float(curr_traj_logp.mean().item()),
+                    "meanflow_trajectory/curr_logp_std": float(curr_traj_logp.std().item()),
+                    "meanflow_trajectory/logratio_mean": float(traj_logratio.mean().item()),
+                    "meanflow_trajectory/logratio_std": float(traj_logratio.std().item()),
+                    "meanflow_trajectory/logp_sigma": float(cfg.meanflow_trajectory_logp_sigma),
+                    "meanflow_trajectory/probe_noise_std": float(cfg.meanflow_trajectory_probe_noise_std),
+                    "meanflow_trajectory/num_probes": float(n_action_samples),
+                }
+                adv_for_metrics = mb_advantages.detach()
+                logratio_for_metrics = traj_logratio.detach()
+                if adv_for_metrics.shape != logratio_for_metrics.shape:
+                    adv_for_metrics = adv_for_metrics.expand_as(logratio_for_metrics)
+                pos_mask = adv_for_metrics > 0
+                neg_mask = adv_for_metrics < 0
+                if pos_mask.any():
+                    traj_metrics["meanflow_trajectory/logratio_pos_adv_mean"] = float(
+                        logratio_for_metrics[pos_mask].mean().item()
+                    )
+                if neg_mask.any():
+                    traj_metrics["meanflow_trajectory/logratio_neg_adv_mean"] = float(
+                        logratio_for_metrics[neg_mask].mean().item()
+                    )
+                cfm_metrics.update(traj_metrics)
             if cfg.policy == "meanflow":
                 cfm_metrics.update(
                     {

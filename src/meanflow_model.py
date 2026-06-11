@@ -199,7 +199,13 @@ class MeanFlowPolicy(PreTrainedPolicy):
 
     # MeanFlow 区间采样推理
     @torch.no_grad
-    def predict_action_chunk(self, batch: dict[str, Tensor], zero_sampling: bool = False, sde_sampling: bool = False) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        zero_sampling: bool = False,
+        sde_sampling: bool = False,
+        return_init_noise: bool = False,
+    ) -> Tensor:
         """MeanFlow 区间采样推理。
 
         使用区间 [t_i, t_{i+1}] 调用网络预测平均速度，
@@ -211,7 +217,8 @@ class MeanFlowPolicy(PreTrainedPolicy):
             sde_sampling: MeanFlow BC 阶段不支持，设为 True 会报错
 
         返回:
-            (actions, mdp_x_t_path)
+            默认返回 (actions, mdp_x_t_path)。return_init_noise=True 时额外返回
+            rollout 使用的初始高斯噪声，用于 trajectory likelihood surrogate。
         """
         # 传入参数校验
         if sde_sampling:
@@ -234,6 +241,7 @@ class MeanFlowPolicy(PreTrainedPolicy):
             x_t = torch.zeros((B, self.config.horizon, self.model.action_dim), device=obs_cond.device)
         else:
             x_t = torch.randn((B, self.config.horizon, self.model.action_dim), device=obs_cond.device)
+        init_noise = x_t.clone()
 
         # 获取时间调度 t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=x_t.device)
         flow_steps = self.config.sampling_steps
@@ -278,7 +286,43 @@ class MeanFlowPolicy(PreTrainedPolicy):
         # 反归一化 action
         actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
 
+        if return_init_noise:
+            return actions, mdp_x_t_path, init_noise
         return actions, mdp_x_t_path
+
+    def rollout_normalized_action_from_noise(self, batch: dict[str, Tensor], init_noise: Tensor) -> Tensor:
+        """从指定初始噪声重放 MeanFlow 采样，返回归一化 action。
+
+        该函数保留梯度，用于在线强化阶段计算 trajectory-level surrogate。
+        输入 batch 只需要 observation；init_noise 形状为 (B, horizon, action_dim)。
+        """
+        batch = self.normalize_inputs(batch)
+        obs_cond = self.model.encode_observations(batch)
+
+        x_t = init_noise
+        flow_steps = self.config.sampling_steps
+        t_path = self.get_schedule(x_t.device)
+
+        for i in range(flow_steps):
+            t_current = t_path[i]
+            t_next = t_path[i + 1]
+
+            t_batch = torch.full((x_t.shape[0],), t_current, device=x_t.device, dtype=x_t.dtype)
+            r_batch = torch.full((x_t.shape[0],), t_next, device=x_t.device, dtype=x_t.dtype)
+            time_emb = self.model.encode_time_pair(t_batch, r_batch)
+
+            u = self.model.forward(x_t=x_t, t_emb=time_emb, obs_cond=obs_cond)
+            u = self.config.mlp_output_scale * u
+            if self.config.transported_clip_value is not None:
+                u = u.clamp(
+                    -self.config.transported_clip_value,
+                    self.config.transported_clip_value,
+                )
+
+            dt = t_current - t_next
+            x_t = x_t - dt * u
+
+        return self.config.actor_scale * x_t
 
     # 使用独立 buffer 为多个环境选择 action
     @torch.no_grad
