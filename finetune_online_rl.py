@@ -113,6 +113,7 @@ class FlowPPOConfig:
     meanflow_anchor_sampling_mode: Literal["random", "schedule"] = "random"
     meanflow_anchor_sampling_steps: int = 1
     meanflow_bc_stage_epochs: int = 0
+    meanflow_bc_stage_selection: Literal["advantage", "success", "success_or_top"] = "advantage"
     meanflow_bc_stage_top_fraction: Optional[float] = None
     meanflow_bc_stage_adv_weight: Literal["binary", "relu", "normalized"] = "binary"
     meanflow_bc_stage_loss_coef: float = 1.0
@@ -1245,11 +1246,21 @@ def main(cfg: FlowPPOConfig):
             chunk_values_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
             chunk_values_next_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
             chunk_valid_lengths_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
+            chunk_episode_ids_stored = torch.full(
+                (chunks_per_iteration, num_envs_per_process),
+                -1,
+                dtype=torch.long,
+            )
+            episode_ids_by_env = torch.arange(num_envs_per_process, dtype=torch.long)
+            next_episode_id_local = num_envs_per_process
+            successful_episode_ids: set[int] = set()
 
             for chunk_idx in range(chunks_per_iteration):
                 with torch.inference_mode():
                     chunk_start_step = chunk_idx * n_action_steps
                     obs_start = copy.deepcopy(next_obs)
+                    chunk_episode_ids = episode_ids_by_env.clone()
+                    chunk_episode_ids_stored[chunk_idx] = chunk_episode_ids
 
                     obs_start_for_value = actor_module.normalize_inputs(copy.deepcopy(obs_start))
                     obs_start_cond = actor_module.model.encode_observations(obs_start_for_value)
@@ -1348,8 +1359,15 @@ def main(cfg: FlowPPOConfig):
 
                         if any(done_cpu):
                             done_episodes += done_cpu.sum().item()
-                            successes += reward_cpu[torch.where(done_cpu)[0]].sum().item()
-                            actor_module.reset(env_ids=torch.where(done_cpu)[0])
+                            done_envs = torch.where(done_cpu)[0]
+                            successes += reward_cpu[done_envs].sum().item()
+                            success_envs = done_envs[reward_cpu[done_envs] > 0]
+                            for env_idx_success in success_envs.tolist():
+                                successful_episode_ids.add(int(chunk_episode_ids[env_idx_success].item()))
+                            for env_idx_done in done_envs.tolist():
+                                episode_ids_by_env[env_idx_done] = next_episode_id_local
+                                next_episode_id_local += 1
+                            actor_module.reset(env_ids=done_envs)
                             chunk_done = done_cpu.to(torch.float)
                             break
 
@@ -1391,6 +1409,11 @@ def main(cfg: FlowPPOConfig):
                             f"sps_local={sps_local:.2f}, SR={msg_sr}"
                         )
 
+            chunk_success_episode_mask = torch.zeros((chunks_per_iteration, num_envs_per_process), dtype=torch.bool)
+            for episode_id in successful_episode_ids:
+                chunk_success_episode_mask |= (chunk_episode_ids_stored == episode_id)
+            chunk_success_episode_mask = chunk_success_episode_mask.float()
+
             step = steps_per_iteration
 
         else:
@@ -1400,6 +1423,7 @@ def main(cfg: FlowPPOConfig):
             chunk_values_stored = None
             chunk_values_next_stored = None
             chunk_valid_lengths_stored = None
+            chunk_success_episode_mask = None
 
         while step < steps_per_iteration:
             with torch.inference_mode():
@@ -1544,11 +1568,13 @@ def main(cfg: FlowPPOConfig):
             b_chunk_discounts = chunk_discounts_stored.reshape(-1)
             b_chunk_dones = chunk_dones_stored.reshape(-1)
             b_chunk_valid_lengths = chunk_valid_lengths_stored.reshape(-1)
+            b_bc_success_mask = chunk_success_episode_mask.reshape(-1)
         else:
             b_chunk_rewards = None
             b_chunk_discounts = None
             b_chunk_dones = None
             b_chunk_valid_lengths = None
+            b_bc_success_mask = torch.zeros(b_actions.shape[0])
 
         b_obs_images = {
             k: obs_images_stored_list[k].reshape(-1, n_action_steps, num_envs_per_process, 3, img_h, img_w)
@@ -1604,6 +1630,7 @@ def main(cfg: FlowPPOConfig):
             "b_chunk_discounts": b_chunk_discounts,
             "b_chunk_dones": b_chunk_dones,
             "b_chunk_valid_lengths": b_chunk_valid_lengths,
+            "b_bc_success_mask": b_bc_success_mask,
             "b_obs_images": b_obs_images,
             "b_obs_state": b_obs_state,
             "b_advantages": b_advantages,
@@ -1664,6 +1691,7 @@ def main(cfg: FlowPPOConfig):
                 batch["b_chunk_discounts"],
                 batch["b_chunk_dones"],
                 batch["b_chunk_valid_lengths"],
+                batch["b_bc_success_mask"],
                 batch["b_obs_images"],
                 batch["b_obs_state"],
                 batch["b_advantages"],
@@ -1687,6 +1715,7 @@ def main(cfg: FlowPPOConfig):
             b_chunk_discounts,
             b_chunk_dones,
             b_chunk_valid_lengths,
+            b_bc_success_mask,
             b_obs_images,
             b_obs_state,
             b_advantages,
@@ -1716,6 +1745,7 @@ def main(cfg: FlowPPOConfig):
         meanflow_bc_stage_updates = 0
         meanflow_bc_stage_rollout_batches = 0
         meanflow_bc_stage_cached_samples = 0
+        meanflow_bc_stage_success_cached_samples = 0
         old_anchor_loss_raw_agg = None
         curr_anchor_loss_raw_agg = None
 
@@ -1733,17 +1763,29 @@ def main(cfg: FlowPPOConfig):
                 return loss_tensor
             return loss_tensor.mean(dim=-1)
 
-        def get_meanflow_bc_weights(advantages_for_selection: torch.Tensor) -> torch.Tensor:
+        def get_meanflow_bc_weights(
+            advantages_for_selection: torch.Tensor,
+            success_mask_for_selection: torch.Tensor | None = None,
+        ) -> torch.Tensor:
             if cfg.rollout_granularity == "chunk":
                 scores = advantages_for_selection[:, 0]
             else:
                 scores = advantages_for_selection.mean(dim=1)
 
-            if cfg.meanflow_bc_stage_top_fraction is not None:
+            selected = None
+            if cfg.meanflow_bc_stage_selection in ("success", "success_or_top"):
+                if success_mask_for_selection is None:
+                    success_selected = torch.zeros_like(scores, dtype=torch.bool)
+                else:
+                    success_selected = success_mask_for_selection.reshape(-1).to(scores.device) > 0.5
+                if success_selected.any() or cfg.meanflow_bc_stage_selection == "success":
+                    selected = success_selected
+
+            if selected is None and cfg.meanflow_bc_stage_top_fraction is not None:
                 k = max(1, math.ceil(scores.numel() * cfg.meanflow_bc_stage_top_fraction))
                 threshold = torch.topk(scores, k=k, largest=True).values.min()
                 selected = scores >= threshold
-            else:
+            elif selected is None:
                 selected = scores > 0
 
             if cfg.meanflow_bc_stage_adv_weight == "binary":
@@ -1849,6 +1891,7 @@ def main(cfg: FlowPPOConfig):
 
         def make_meanflow_bc_cache_ref(batch: Dict[str, Any], cache_name: str) -> Dict[str, Any] | Path:
             nonlocal meanflow_bc_stage_rollout_batches, meanflow_bc_stage_cached_samples
+            nonlocal meanflow_bc_stage_success_cached_samples
 
             cache = {
                 "actions": batch["b_actions"].detach().cpu().contiguous(),
@@ -1857,6 +1900,7 @@ def main(cfg: FlowPPOConfig):
                 "cfm_loss_epsilons": batch["b_cfm_loss_epsilons"].detach().cpu().contiguous(),
                 "cfm_value_invalid": batch["b_cfm_value_invalid"].detach().cpu().contiguous(),
                 "advantages": batch["b_advantages"].detach().cpu().contiguous(),
+                "success_mask": batch["b_bc_success_mask"].detach().cpu().contiguous(),
                 "obs_state": batch["b_obs_state"][:, 0].detach().cpu().contiguous(),
                 "obs_images": {
                     k: v[:, 0].detach().cpu().contiguous()
@@ -1865,6 +1909,7 @@ def main(cfg: FlowPPOConfig):
             }
             meanflow_bc_stage_rollout_batches += 1
             meanflow_bc_stage_cached_samples += int(cache["actions"].shape[0])
+            meanflow_bc_stage_success_cached_samples += int(cache["success_mask"].sum().item())
 
             if cfg.meanflow_bc_stage_cache_mode == "disk":
                 cache_root = (
@@ -1929,13 +1974,17 @@ def main(cfg: FlowPPOConfig):
                         mb_cfm_loss_epsilons_stage = cache["cfm_loss_epsilons"][mb_inds].to(device)
                         mb_cfm_value_invalid_stage = cache["cfm_value_invalid"][mb_inds].to(device)
                         mb_advantages_stage = cache["advantages"][mb_inds].to(device)
+                        mb_success_mask_stage = cache["success_mask"][mb_inds].to(device)
                         mb_obs_images_stage = {
                             k: v[mb_inds].to(device)
                             for k, v in cache["obs_images"].items()
                         }
                         mb_obs_state_stage = cache["obs_state"][mb_inds].to(device)
 
-                        stage_weights, selected_fraction = get_meanflow_bc_weights(mb_advantages_stage)
+                        stage_weights, selected_fraction = get_meanflow_bc_weights(
+                            mb_advantages_stage,
+                            mb_success_mask_stage,
+                        )
                         stage_selected_fractions.append(selected_fraction)
                         if stage_weights.sum().item() <= 0:
                             continue
@@ -2012,6 +2061,7 @@ def main(cfg: FlowPPOConfig):
                 b_chunk_discounts,
                 b_chunk_dones,
                 b_chunk_valid_lengths,
+                b_bc_success_mask,
                 b_obs_images,
                 b_obs_state,
                 b_advantages,
@@ -2364,6 +2414,7 @@ def main(cfg: FlowPPOConfig):
                             b_chunk_discounts,
                             b_chunk_dones,
                             b_chunk_valid_lengths,
+                            b_bc_success_mask,
                             b_obs_images,
                             b_obs_state,
                             b_advantages,
@@ -2467,7 +2518,14 @@ def main(cfg: FlowPPOConfig):
                         "meanflow_bc_stage/rollout_repeats": float(cfg.meanflow_bc_stage_rollout_repeats),
                         "meanflow_bc_stage/rollout_batches": float(meanflow_bc_stage_rollout_batches),
                         "meanflow_bc_stage/cached_samples": float(meanflow_bc_stage_cached_samples),
+                        "meanflow_bc_stage/success_cached_samples": float(meanflow_bc_stage_success_cached_samples),
+                        "meanflow_bc_stage/success_cached_fraction": float(
+                            meanflow_bc_stage_success_cached_samples / max(1, meanflow_bc_stage_cached_samples)
+                        ),
                         "meanflow_bc_stage/cache_mode": 1.0 if cfg.meanflow_bc_stage_cache_mode == "disk" else 0.0,
+                        "meanflow_bc_stage/selection_mode": float(
+                            {"advantage": 0, "success": 1, "success_or_top": 2}[cfg.meanflow_bc_stage_selection]
+                        ),
                         "meanflow_bc_stage/loss": float(meanflow_bc_stage_loss_value),
                         "meanflow_bc_stage/selected_fraction": float(meanflow_bc_stage_selected_fraction),
                         "meanflow_bc_stage/updates": float(meanflow_bc_stage_updates),
