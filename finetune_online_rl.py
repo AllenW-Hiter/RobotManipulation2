@@ -115,6 +115,8 @@ class FlowPPOConfig:
     meanflow_bc_stage_top_fraction: Optional[float] = None
     meanflow_bc_stage_adv_weight: Literal["binary", "relu", "normalized"] = "binary"
     meanflow_bc_stage_loss_coef: float = 1.0
+    meanflow_bc_stage_interval: int = 1
+    meanflow_bc_stage_rollout_repeats: int = 1
     meanflow_stage_sampling_mode: Literal["shared", "separate"] = "shared"
     meanflow_value_update_mode: Literal["joint", "first_rollout", "each_rollout"] = "joint"
     meanflow_stage_update_order: Literal["meanflow_first", "anchor_first"] = "meanflow_first"
@@ -805,10 +807,22 @@ def main(cfg: FlowPPOConfig):
             raise ValueError("--meanflow_bc_stage_epochs must be >= 0.")
         if cfg.meanflow_bc_stage_loss_coef < 0:
             raise ValueError("--meanflow_bc_stage_loss_coef must be >= 0.")
+        if cfg.meanflow_bc_stage_interval <= 0:
+            raise ValueError("--meanflow_bc_stage_interval must be positive.")
+        if cfg.meanflow_bc_stage_rollout_repeats <= 0:
+            raise ValueError("--meanflow_bc_stage_rollout_repeats must be positive.")
         if cfg.meanflow_bc_stage_top_fraction is not None and not (0 < cfg.meanflow_bc_stage_top_fraction <= 1):
             raise ValueError("--meanflow_bc_stage_top_fraction must be in (0, 1].")
         if cfg.meanflow_stage_sampling_mode == "separate" and cfg.meanflow_bc_stage_epochs <= 0:
             raise ValueError("--meanflow_stage_sampling_mode separate requires --meanflow_bc_stage_epochs > 0.")
+        if cfg.meanflow_bc_stage_rollout_repeats > 1 and not (
+            cfg.meanflow_stage_sampling_mode == "separate"
+            and cfg.meanflow_stage_update_order == "anchor_first"
+        ):
+            raise ValueError(
+                "--meanflow_bc_stage_rollout_repeats > 1 is only supported with "
+                "--meanflow_stage_sampling_mode separate and --meanflow_stage_update_order anchor_first."
+            )
     elif cfg.meanflow_fpo_loss_source != "cfm":
         raise ValueError("--meanflow_fpo_loss_source anchor is only valid for --policy meanflow.")
     elif cfg.meanflow_stage_sampling_mode != "shared":
@@ -817,6 +831,10 @@ def main(cfg: FlowPPOConfig):
         raise ValueError("--meanflow_value_update_mode is only valid for --policy meanflow.")
     elif cfg.meanflow_stage_update_order != "meanflow_first":
         raise ValueError("--meanflow_stage_update_order anchor_first is only valid for --policy meanflow.")
+    elif cfg.meanflow_bc_stage_interval != 1:
+        raise ValueError("--meanflow_bc_stage_interval is only valid for --policy meanflow.")
+    elif cfg.meanflow_bc_stage_rollout_repeats != 1:
+        raise ValueError("--meanflow_bc_stage_rollout_repeats is only valid for --policy meanflow.")
 
 
     # --------- 应用策略覆盖项（所有 rank 必须一致） ----
@@ -962,15 +980,19 @@ def main(cfg: FlowPPOConfig):
         local_batch_size = batch_size
         minibatch_size = max(batch_size // cfg.num_minibatches, 1)
 
-    rollout_passes_per_iteration = (
-        2
-        if (
-            cfg.policy == "meanflow"
-            and cfg.meanflow_stage_sampling_mode == "separate"
-            and cfg.meanflow_bc_stage_epochs > 0
+    rollout_passes_per_iteration = 1.0
+    if (
+        cfg.policy == "meanflow"
+        and cfg.meanflow_stage_sampling_mode == "separate"
+        and cfg.meanflow_bc_stage_epochs > 0
+        and cfg.meanflow_bc_stage_loss_coef > 0
+    ):
+        bc_rollout_repeats = (
+            cfg.meanflow_bc_stage_rollout_repeats
+            if cfg.meanflow_stage_update_order == "anchor_first"
+            else 1
         )
-        else 1
-    )
+        rollout_passes_per_iteration += bc_rollout_repeats / cfg.meanflow_bc_stage_interval
     env_steps_per_iteration = cfg.data_collection_steps * cfg.num_envs * rollout_passes_per_iteration
     num_iterations = math.ceil(cfg.total_timesteps / env_steps_per_iteration)
     assert cfg.gradient_accumulation_steps <= cfg.num_minibatches
@@ -1592,12 +1614,17 @@ def main(cfg: FlowPPOConfig):
             ))
 
         iteration_start_time = time.time()
-        do_meanflow_bc_stage = (
+        meanflow_bc_stage_enabled = (
             cfg.policy == "meanflow"
             and cfg.meanflow_bc_stage_epochs > 0
             and cfg.meanflow_bc_stage_loss_coef > 0
             and iteration > cfg.n_iterations_train_only_value
         )
+        meanflow_bc_stage_due = (
+            meanflow_bc_stage_enabled
+            and iteration % cfg.meanflow_bc_stage_interval == 0
+        )
+        do_meanflow_bc_stage = meanflow_bc_stage_due
         use_separate_stage_sampling = do_meanflow_bc_stage and cfg.meanflow_stage_sampling_mode == "separate"
         meanflow_first = cfg.meanflow_stage_update_order == "meanflow_first"
         if use_separate_stage_sampling:
@@ -1674,6 +1701,7 @@ def main(cfg: FlowPPOConfig):
         meanflow_bc_stage_loss_value = 0.0
         meanflow_bc_stage_selected_fraction = 0.0
         meanflow_bc_stage_updates = 0
+        meanflow_bc_stage_rollout_batches = 0
 
         def aggregate_sample_loss(loss_tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
             loss_tensor = loss_tensor.reshape(loss_tensor.shape[0], -1, n_groups, group_size)
@@ -1806,6 +1834,7 @@ def main(cfg: FlowPPOConfig):
         def run_meanflow_bc_stage() -> None:
             nonlocal actor_grad_norm_before, actor_grad_norm_after
             nonlocal meanflow_bc_stage_loss_value, meanflow_bc_stage_selected_fraction, meanflow_bc_stage_updates
+            nonlocal meanflow_bc_stage_rollout_batches
 
             if not do_meanflow_bc_stage:
                 return
@@ -1814,17 +1843,21 @@ def main(cfg: FlowPPOConfig):
             if cfg.freeze_vision_encoder:
                 actor_module.model.vision_encoder.eval()
 
+            stage_batch_size = b_actions.shape[0]
+            if stage_batch_size <= 0:
+                return
+            meanflow_bc_stage_rollout_batches += 1
             stage_selected_fractions = []
             for stage_epoch in trange(
                 cfg.meanflow_bc_stage_epochs,
                 desc=f"[Rank {rank}] MeanFlow BC stage",
                 disable=(rank != 0),
             ):
-                stage_inds = b_inds.copy()
+                stage_inds = np.arange(stage_batch_size)
                 np.random.shuffle(stage_inds)
                 optimizer_actor.zero_grad(set_to_none=True)
 
-                for start in range(0, local_batch_size, minibatch_size):
+                for start in range(0, stage_batch_size, minibatch_size):
                     end = start + minibatch_size
                     mb_inds = stage_inds[start:end]
 
@@ -2218,44 +2251,49 @@ def main(cfg: FlowPPOConfig):
                 break
 
         if do_meanflow_bc_stage and not meanflow_first:
-            if use_separate_stage_sampling:
-                active_batch = collect_rollout_batch("stage_a", reset_env_for_rollout=cfg.reset_every_iteration)
-                (
-                    b_actions,
-                    b_cfm_losses,
-                    b_meanflow_anchor_losses,
-                    b_cfm_loss_ts,
-                    b_cfm_loss_rs,
-                    b_cfm_loss_epsilons,
-                    b_dppo_log_probs,
-                    b_mdp_x_t_paths,
-                    b_cfm_value_invalid,
-                    b_values,
-                    b_dones,
-                    b_rewards,
-                    b_chunk_rewards,
-                    b_chunk_discounts,
-                    b_chunk_dones,
-                    b_chunk_valid_lengths,
-                    b_obs_images,
-                    b_obs_state,
-                    b_advantages,
-                    b_returns,
-                ) = unpack_rollout_batch(active_batch)
-                total_successes_global += active_batch["successes_global"]
-                total_episodes_global += active_batch["episodes_global"]
-                success_rate_global = (
-                    total_successes_global / total_episodes_global if total_episodes_global > 0 else 0.0
-                )
-                sps_steps += active_batch["sps_steps"]
-                sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
-                b_inds = np.arange(local_batch_size)
+            bc_stage_rollout_repeats = cfg.meanflow_bc_stage_rollout_repeats if use_separate_stage_sampling else 1
+            for bc_stage_rollout_idx in range(bc_stage_rollout_repeats):
+                if use_separate_stage_sampling:
+                    stage_a_name = "stage_a"
+                    if bc_stage_rollout_repeats > 1:
+                        stage_a_name = f"stage_a_bc_{bc_stage_rollout_idx + 1}_of_{bc_stage_rollout_repeats}"
+                    active_batch = collect_rollout_batch(stage_a_name, reset_env_for_rollout=cfg.reset_every_iteration)
+                    (
+                        b_actions,
+                        b_cfm_losses,
+                        b_meanflow_anchor_losses,
+                        b_cfm_loss_ts,
+                        b_cfm_loss_rs,
+                        b_cfm_loss_epsilons,
+                        b_dppo_log_probs,
+                        b_mdp_x_t_paths,
+                        b_cfm_value_invalid,
+                        b_values,
+                        b_dones,
+                        b_rewards,
+                        b_chunk_rewards,
+                        b_chunk_discounts,
+                        b_chunk_dones,
+                        b_chunk_valid_lengths,
+                        b_obs_images,
+                        b_obs_state,
+                        b_advantages,
+                        b_returns,
+                    ) = unpack_rollout_batch(active_batch)
+                    total_successes_global += active_batch["successes_global"]
+                    total_episodes_global += active_batch["episodes_global"]
+                    success_rate_global = (
+                        total_successes_global / total_episodes_global if total_episodes_global > 0 else 0.0
+                    )
+                    sps_steps += active_batch["sps_steps"]
+                    sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
+                    b_inds = np.arange(b_actions.shape[0])
 
-                if meanflow_preupdate_value and cfg.meanflow_value_update_mode == "each_rollout":
-                    v_loss = run_value_update("stage_a")
-                    loss = v_loss
+                    if meanflow_preupdate_value and cfg.meanflow_value_update_mode == "each_rollout":
+                        v_loss = run_value_update(stage_a_name)
+                        loss = v_loss
 
-            run_meanflow_bc_stage()
+                run_meanflow_bc_stage()
 
         # 指标（rank 本地）
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -2303,6 +2341,11 @@ def main(cfg: FlowPPOConfig):
                         "meanflow_stage/value_update_mode": float(
                             {"joint": 0, "first_rollout": 1, "each_rollout": 2}[cfg.meanflow_value_update_mode]
                         ),
+                        "meanflow_bc_stage/enabled": float(meanflow_bc_stage_enabled),
+                        "meanflow_bc_stage/due": float(meanflow_bc_stage_due),
+                        "meanflow_bc_stage/interval": float(cfg.meanflow_bc_stage_interval),
+                        "meanflow_bc_stage/rollout_repeats": float(cfg.meanflow_bc_stage_rollout_repeats),
+                        "meanflow_bc_stage/rollout_batches": float(meanflow_bc_stage_rollout_batches),
                         "meanflow_bc_stage/loss": float(meanflow_bc_stage_loss_value),
                         "meanflow_bc_stage/selected_fraction": float(meanflow_bc_stage_selected_fraction),
                         "meanflow_bc_stage/updates": float(meanflow_bc_stage_updates),
