@@ -107,6 +107,17 @@ class FlowPPOConfig:
     exploration_noise_std: Optional[float] = None
     zero_sampling: bool = True  # 已废弃；现在评估时同时使用 zero 和 non-zero sampling
     save_non_zero_sampling_video: bool = False
+    meanflow_fpo_loss_source: Literal["cfm", "anchor"] = "cfm"
+    meanflow_anchor_logratio_coef: float = 1.0
+    meanflow_anchor_sampling_mode: Literal["random", "schedule"] = "random"
+    meanflow_anchor_sampling_steps: int = 1
+    meanflow_bc_stage_epochs: int = 0
+    meanflow_bc_stage_top_fraction: Optional[float] = None
+    meanflow_bc_stage_adv_weight: Literal["binary", "relu", "normalized"] = "binary"
+    meanflow_bc_stage_loss_coef: float = 1.0
+    meanflow_stage_sampling_mode: Literal["shared", "separate"] = "shared"
+    meanflow_value_update_mode: Literal["joint", "first_rollout", "each_rollout"] = "joint"
+    meanflow_stage_update_order: Literal["meanflow_first", "anchor_first"] = "meanflow_first"
 
     # DPPO
     sde_sigma: float = 0.08
@@ -786,6 +797,26 @@ def main(cfg: FlowPPOConfig):
             raise ValueError("MeanFlow online RL first stage does not support --learn_sde_sigma True.")
         if not cfg.do_chunk_level_ppo:
             raise ValueError("MeanFlow online RL first stage requires --do_chunk_level_ppo True.")
+        if cfg.meanflow_anchor_logratio_coef <= 0:
+            raise ValueError("--meanflow_anchor_logratio_coef must be positive.")
+        if cfg.meanflow_anchor_sampling_steps <= 0:
+            raise ValueError("--meanflow_anchor_sampling_steps must be positive.")
+        if cfg.meanflow_bc_stage_epochs < 0:
+            raise ValueError("--meanflow_bc_stage_epochs must be >= 0.")
+        if cfg.meanflow_bc_stage_loss_coef < 0:
+            raise ValueError("--meanflow_bc_stage_loss_coef must be >= 0.")
+        if cfg.meanflow_bc_stage_top_fraction is not None and not (0 < cfg.meanflow_bc_stage_top_fraction <= 1):
+            raise ValueError("--meanflow_bc_stage_top_fraction must be in (0, 1].")
+        if cfg.meanflow_stage_sampling_mode == "separate" and cfg.meanflow_bc_stage_epochs <= 0:
+            raise ValueError("--meanflow_stage_sampling_mode separate requires --meanflow_bc_stage_epochs > 0.")
+    elif cfg.meanflow_fpo_loss_source != "cfm":
+        raise ValueError("--meanflow_fpo_loss_source anchor is only valid for --policy meanflow.")
+    elif cfg.meanflow_stage_sampling_mode != "shared":
+        raise ValueError("--meanflow_stage_sampling_mode separate is only valid for --policy meanflow.")
+    elif cfg.meanflow_value_update_mode != "joint":
+        raise ValueError("--meanflow_value_update_mode is only valid for --policy meanflow.")
+    elif cfg.meanflow_stage_update_order != "meanflow_first":
+        raise ValueError("--meanflow_stage_update_order anchor_first is only valid for --policy meanflow.")
 
 
     # --------- 应用策略覆盖项（所有 rank 必须一致） ----
@@ -931,7 +962,16 @@ def main(cfg: FlowPPOConfig):
         local_batch_size = batch_size
         minibatch_size = max(batch_size // cfg.num_minibatches, 1)
 
-    env_steps_per_iteration = cfg.data_collection_steps * cfg.num_envs
+    rollout_passes_per_iteration = (
+        2
+        if (
+            cfg.policy == "meanflow"
+            and cfg.meanflow_stage_sampling_mode == "separate"
+            and cfg.meanflow_bc_stage_epochs > 0
+        )
+        else 1
+    )
+    env_steps_per_iteration = cfg.data_collection_steps * cfg.num_envs * rollout_passes_per_iteration
     num_iterations = math.ceil(cfg.total_timesteps / env_steps_per_iteration)
     assert cfg.gradient_accumulation_steps <= cfg.num_minibatches
     effective_minibatch_size = minibatch_size * cfg.gradient_accumulation_steps
@@ -1033,6 +1073,7 @@ def main(cfg: FlowPPOConfig):
     dones_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     values_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     cfm_losses_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
+    meanflow_anchor_losses_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_ts_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_rs_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples))
     cfm_loss_epsilons_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples, action_dim))
@@ -1078,6 +1119,39 @@ def main(cfg: FlowPPOConfig):
         )
         return cfm_loss, cfm_loss_t, None, cfm_loss_eps
 
+    def get_cfm_and_anchor_values(
+        actor,
+        obs,
+        n_action_samples=1,
+        cfm_loss_ts=None,
+        cfm_loss_rs=None,
+        cfm_loss_epsilons=None,
+        debug=False,
+    ):
+        actor_unwrapped = actor.module if hasattr(actor, "module") else actor
+        if isinstance(actor_unwrapped, MeanFlowPolicy):
+            cfm_loss, anchor_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = actor(
+                obs,
+                n_action_samples=n_action_samples,
+                cfm_loss_t=cfm_loss_ts,
+                cfm_loss_r=cfm_loss_rs,
+                cfm_loss_eps=cfm_loss_epsilons,
+                debug=debug,
+                return_anchor_loss=True,
+                anchor_sampling_mode=cfg.meanflow_anchor_sampling_mode,
+                anchor_sampling_steps=cfg.meanflow_anchor_sampling_steps,
+            )
+            return cfm_loss, anchor_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps
+
+        cfm_loss, cfm_loss_t, cfm_loss_eps = actor(
+            obs,
+            n_action_samples=n_action_samples,
+            cfm_loss_t=cfm_loss_ts,
+            cfm_loss_eps=cfm_loss_epsilons,
+            debug=debug,
+        )
+        return cfm_loss, None, cfm_loss_t, None, cfm_loss_eps
+
     def get_log_prob_and_entropy(actor, obs):
         log_prob, entropy, sde_sigma = actor(obs, is_dppo=True)
 
@@ -1091,29 +1165,42 @@ def main(cfg: FlowPPOConfig):
         value = critic(obs_cond)
         return action, mdp_x_t_path, value
 
-    # ----------------- 训练循环 ---------------------
-    logger.info(colored(f"[Rank {rank}] Starting the main training loop", "green"))
+    def collect_rollout_batch(stage_name: str, reset_env_for_rollout: bool) -> Dict[str, Any]:
+        nonlocal next_obs, next_done, global_step
 
-    while (iteration * cfg.data_collection_steps * cfg.num_envs) < cfg.total_timesteps:
-        iteration += 1
-        if rank == 0:
-            logger.info(colored(
-                f"Iteration: {iteration}/{num_iterations} | "
-                f"Global step (approx): {global_step}/{cfg.total_timesteps}", "yellow"
-            ))
-
-        if cfg.reset_every_iteration:
+        if reset_env_for_rollout:
             next_obs, _ = env.reset()
+            next_done = torch.zeros(num_envs_per_process)
             actor_module.reset()
+
+        for tensor in (
+            obs_state_stored,
+            actions_stored,
+            mdp_x_t_paths_stored,
+            rewards_stored,
+            dones_stored,
+            values_stored,
+            cfm_losses_stored,
+            meanflow_anchor_losses_stored,
+            cfm_loss_ts_stored,
+            cfm_loss_rs_stored,
+            cfm_loss_epsilons_stored,
+            cfm_value_invalid_stored,
+            dppo_log_probs_stored,
+        ):
+            tensor.zero_()
+        for tensor in obs_images_stored_list.values():
+            tensor.zero_()
 
         done_episodes = 0
         successes = 0
         step = 0
-        iteration_start_time = time.time()
+        executed_env_steps = 0
+        rollout_start_time = time.time()
 
         actor.eval()
         critic.eval()
-        logger.info(f"[Rank {rank}] Starting data collection...")
+        logger.info(f"[Rank {rank}] Starting data collection ({stage_name})...")
 
         if cfg.rollout_granularity == "chunk":
             chunks_per_iteration = steps_per_iteration // n_action_steps
@@ -1123,7 +1210,6 @@ def main(cfg: FlowPPOConfig):
             chunk_values_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
             chunk_values_next_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
             chunk_valid_lengths_stored = torch.zeros((chunks_per_iteration, num_envs_per_process))
-            executed_env_steps = 0
 
             for chunk_idx in range(chunks_per_iteration):
                 with torch.inference_mode():
@@ -1155,6 +1241,7 @@ def main(cfg: FlowPPOConfig):
                         (n_action_steps, num_envs_per_process, n_action_samples),
                         device=action_chunks.device,
                     )
+                    meanflow_anchor_loss = torch.zeros_like(cfm_loss)
                     cfm_loss_t = torch.zeros_like(cfm_loss)
                     cfm_loss_r = torch.zeros_like(cfm_loss)
                     cfm_loss_eps = torch.zeros(
@@ -1164,11 +1251,13 @@ def main(cfg: FlowPPOConfig):
                     if cfg.loss_mode == "fpo":
                         obs_chunk_for_cfm = copy.deepcopy(obs_start)
                         obs_chunk_for_cfm["action"] = action_chunks
-                        cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_values(
+                        cfm_loss, maybe_anchor_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_and_anchor_values(
                             actor,
                             obs_chunk_for_cfm,
                             n_action_samples,
                         )
+                        if maybe_anchor_loss is not None:
+                            meanflow_anchor_loss = maybe_anchor_loss
 
                     dppo_log_prob = torch.zeros(
                         (num_envs_per_process, n_action_steps, actor_module.config.sampling_steps),
@@ -1190,14 +1279,15 @@ def main(cfg: FlowPPOConfig):
                             if obs_key.startswith("observation.images."):
                                 obs_images_stored_list[obs_key][storage_step] = obs_value.cpu()
                         obs_state_stored[storage_step] = obs_for_slot["observation.state"].cpu()
-                        values_stored[storage_step] = value_start.cpu()
-                        actions_stored[storage_step] = action_chunks[:, action_idx].cpu()
-                        mdp_x_t_paths_stored[storage_step] = mdp_x_t_path_chunk[:, action_idx].permute(1, 0, 2).cpu()
-                        cfm_losses_stored[storage_step] = cfm_loss[action_idx].cpu()
-                        cfm_loss_ts_stored[storage_step] = cfm_loss_t[action_idx].cpu()
-                        cfm_loss_rs_stored[storage_step] = cfm_loss_r[action_idx].cpu()
-                        cfm_loss_epsilons_stored[storage_step] = cfm_loss_eps[action_idx].cpu()
-                        dppo_log_probs_stored[storage_step] = dppo_log_prob[:, action_idx].permute(1, 0).cpu()
+                        values_stored[storage_step] = value_start.detach().cpu()
+                        actions_stored[storage_step] = action_chunks[:, action_idx].detach().cpu()
+                        mdp_x_t_paths_stored[storage_step] = mdp_x_t_path_chunk[:, action_idx].permute(1, 0, 2).detach().cpu()
+                        cfm_losses_stored[storage_step] = cfm_loss[action_idx].detach().cpu()
+                        meanflow_anchor_losses_stored[storage_step] = meanflow_anchor_loss[action_idx].detach().cpu()
+                        cfm_loss_ts_stored[storage_step] = cfm_loss_t[action_idx].detach().cpu()
+                        cfm_loss_rs_stored[storage_step] = cfm_loss_r[action_idx].detach().cpu()
+                        cfm_loss_epsilons_stored[storage_step] = cfm_loss_eps[action_idx].detach().cpu()
+                        dppo_log_probs_stored[storage_step] = dppo_log_prob[:, action_idx].permute(1, 0).detach().cpu()
                         cfm_value_invalid_stored[storage_step] = 1.0 if invalid else 0.0
 
                     for action_idx in range(n_action_steps):
@@ -1255,18 +1345,26 @@ def main(cfg: FlowPPOConfig):
                     next_done = torch.zeros(num_envs_per_process)
 
                     if chunk_idx > 0 and chunk_idx % 20 == 0:
-                        sps_local = executed_env_steps / (time.time() - iteration_start_time + 1e-9)
+                        sps_local = executed_env_steps / (time.time() - rollout_start_time + 1e-9)
                         if done_episodes > 0:
                             success_rate = successes / done_episodes
                             msg_sr = f"{success_rate:.2%} from {int(done_episodes)} episodes"
                         else:
                             msg_sr = "0.00% from 0 episodes"
                         logger.info(
-                            f"[Rank {rank}] chunk={chunk_idx}/{chunks_per_iteration}, "
+                            f"[Rank {rank}] {stage_name} chunk={chunk_idx}/{chunks_per_iteration}, "
                             f"sps_local={sps_local:.2f}, SR={msg_sr}"
                         )
 
             step = steps_per_iteration
+
+        else:
+            chunk_rewards_stored = None
+            chunk_discounts_stored = None
+            chunk_dones_stored = None
+            chunk_values_stored = None
+            chunk_values_next_stored = None
+            chunk_valid_lengths_stored = None
 
         while step < steps_per_iteration:
             with torch.inference_mode():
@@ -1293,11 +1391,12 @@ def main(cfg: FlowPPOConfig):
                             obs_images_stored_list[obs_key][step] = obs_value.cpu()
                     obs_state_stored[step] = curr_obs["observation.state"].cpu()
 
-                    values_stored[step] = value.flatten().cpu()
-                    actions_stored[step] = action.cpu()
-                    mdp_x_t_paths_stored[step] = mdp_x_t_path.permute(1, 0, 2).cpu()
+                    values_stored[step] = value.flatten().detach().cpu()
+                    actions_stored[step] = action.detach().cpu()
+                    mdp_x_t_paths_stored[step] = mdp_x_t_path.permute(1, 0, 2).detach().cpu()
                     rewards_stored[step] = reward.view(-1).cpu()
                     next_done = next_done.view(-1).cpu()
+                    executed_env_steps += num_envs_per_process
 
                     if any(next_done):
                         done_episodes += next_done.sum().item()
@@ -1305,51 +1404,42 @@ def main(cfg: FlowPPOConfig):
                         actor_module.reset(env_ids=torch.where(next_done)[0])
 
                     if step > 0 and step % 100 == 0:
-                        sps_local = step * num_envs_per_process / (time.time() - iteration_start_time + 1e-9)
+                        sps_local = executed_env_steps / (time.time() - rollout_start_time + 1e-9)
                         if done_episodes > 0:
                             success_rate = successes / done_episodes
                             msg_sr = f"{success_rate:.2%} from {int(done_episodes)} episodes"
                         else:
                             msg_sr = "0.00% from 0 episodes"
-                        logger.info(f"[Rank {rank}] step={step}/{steps_per_iteration}, "
+                        logger.info(f"[Rank {rank}] {stage_name} step={step}/{steps_per_iteration}, "
                                     f"sps_local={sps_local:.2f}, SR={msg_sr}")
 
                     action_idx += 1
                     step += 1
 
-                    # 仅 rank 0 推进近似 global_step
                     if rank == 0:
                         global_step += cfg.num_envs
 
-                # 获取当前 chunk 的 CFM 值
                 actor_module.reset()
                 next_done[:] = False
 
-                curr_obs_chunk = first_obs_from_chunk
+                curr_obs_chunk = copy.deepcopy(first_obs_from_chunk)
                 curr_obs_chunk["action"] = actions_stored[step - action_idx:step].permute(1, 0, 2).to(device)
 
-                # 已存储的 action
-                # curr_obs_chunk["action"] = actions_stored[step - horizon:step] 
-                
-                # 用于 FPO 微调
-                cfm_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_values(
+                cfm_loss, meanflow_anchor_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_and_anchor_values(
                     actor, curr_obs_chunk, n_action_samples
                 )
-                cfm_losses_stored[step - action_idx:step] = cfm_loss.cpu()
-                cfm_loss_ts_stored[step - action_idx:step] = cfm_loss_t.cpu()
+                cfm_losses_stored[step - action_idx:step] = cfm_loss.detach().cpu()
+                if meanflow_anchor_loss is not None:
+                    meanflow_anchor_losses_stored[step - action_idx:step] = meanflow_anchor_loss.detach().cpu()
+                cfm_loss_ts_stored[step - action_idx:step] = cfm_loss_t.detach().cpu()
                 if cfm_loss_r is not None:
-                    cfm_loss_rs_stored[step - action_idx:step] = cfm_loss_r.cpu()
-                cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.cpu()
+                    cfm_loss_rs_stored[step - action_idx:step] = cfm_loss_r.detach().cpu()
+                cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.detach().cpu()
 
-                # 用于 DPPO 微调
-                # mdp_x_t_paths_stored: (n_action_steps, sampling_steps, num_envs_per_process, action_dim) 
-                # ->: (num_envs_per_process, n_action_steps, sampling_steps, action_dim)
                 curr_obs_chunk["mdp_x_t_path"] = mdp_x_t_paths_stored[step - action_idx:step].permute(2, 0, 1, 3).to(device)
-                dppo_log_prob, dppo_entropy, dppo_sde_sigma = get_log_prob_and_entropy(actor, curr_obs_chunk) # dppo_log_prob: (num_envs, horizon, sampling_steps)
-                dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).cpu()
-                # dppo_entropy 和 dppo_sde_sigma 不在数据采集阶段存储，只在训练阶段使用
+                dppo_log_prob, _, _ = get_log_prob_and_entropy(actor, curr_obs_chunk)
+                dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).detach().cpu()
 
-                # FPO 和 DPPO 微调都应使用
                 chunk_dones = dones_stored[step - action_idx:step]
                 cfm_value_invalid_chunk = cfm_value_invalid_stored[step - action_idx:step]
                 for i in range(num_envs_per_process):
@@ -1358,12 +1448,10 @@ def main(cfg: FlowPPOConfig):
                         cfm_value_invalid_chunk[chunk_done_idx:, i] = 1
                 cfm_value_invalid_stored[step - action_idx:step] = cfm_value_invalid_chunk
 
-        # 当前 rank 的本地 SR
         success_rate_local = (successes / done_episodes) if done_episodes > 0 else 0.0
-        sps_steps = executed_env_steps if cfg.rollout_granularity == "chunk" else steps_per_iteration * num_envs_per_process
-        sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
+        sps_steps = executed_env_steps
+        sps_local_total = sps_steps / (time.time() - rollout_start_time + 1e-9)
 
-        # 可选地将 SR 统计规约到 rank 0；训练本身不严格依赖它
         if is_ddp:
             t = torch.tensor([successes, done_episodes], dtype=torch.float32, device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1376,15 +1464,18 @@ def main(cfg: FlowPPOConfig):
 
         if rank == 0:
             logger.info(
-                f"[Rank {rank}] SR: {success_rate_global:.2%} from {int(episodes_global)} episodes | SPS_local(rank0 est): {sps_local_total:.2f}"
+                f"[Rank {rank}] {stage_name} SR: {success_rate_global:.2%} from {int(episodes_global)} episodes | "
+                f"SPS_local(rank0 est): {sps_local_total:.2f}"
             )
 
-        # ---------- 为训练重塑形状 ----------
         b_actions = actions_stored.reshape(-1, n_action_steps, num_envs_per_process, action_dim)
         b_actions = b_actions.permute(0, 2, 1, 3).reshape(-1, n_action_steps, action_dim)
 
         b_cfm_losses = cfm_losses_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples)
         b_cfm_losses = b_cfm_losses.permute(0, 2, 1, 3).reshape(-1, n_action_steps, n_action_samples)
+
+        b_meanflow_anchor_losses = meanflow_anchor_losses_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples)
+        b_meanflow_anchor_losses = b_meanflow_anchor_losses.permute(0, 2, 1, 3).reshape(-1, n_action_steps, n_action_samples)
 
         b_cfm_loss_ts = cfm_loss_ts_stored.reshape(-1, n_action_steps, num_envs_per_process, n_action_samples)
         b_cfm_loss_ts = b_cfm_loss_ts.permute(0, 2, 1, 3).reshape(-1, n_action_steps, n_action_samples)
@@ -1412,11 +1503,17 @@ def main(cfg: FlowPPOConfig):
 
         b_rewards = rewards_stored.reshape(-1, n_action_steps, num_envs_per_process)
         b_rewards = b_rewards.permute(0, 2, 1).reshape(-1, n_action_steps)
+
         if cfg.rollout_granularity == "chunk":
             b_chunk_rewards = chunk_rewards_stored.reshape(-1)
             b_chunk_discounts = chunk_discounts_stored.reshape(-1)
             b_chunk_dones = chunk_dones_stored.reshape(-1)
             b_chunk_valid_lengths = chunk_valid_lengths_stored.reshape(-1)
+        else:
+            b_chunk_rewards = None
+            b_chunk_discounts = None
+            b_chunk_dones = None
+            b_chunk_valid_lengths = None
 
         b_obs_images = {
             k: obs_images_stored_list[k].reshape(-1, n_action_steps, num_envs_per_process, 3, img_h, img_w)
@@ -1431,7 +1528,6 @@ def main(cfg: FlowPPOConfig):
         b_obs_state = b_obs_state.permute(0, 2, 1, 3).reshape(-1, n_action_steps, joint_pos_dim)
 
         if cfg.rollout_granularity == "chunk":
-            # ---------- Chunk 级 Advantage 计算 ----------
             advantages, returns = calculate_chunk_advantage(
                 chunk_values_stored,
                 chunk_values_next_stored,
@@ -1443,20 +1539,125 @@ def main(cfg: FlowPPOConfig):
             b_returns = returns.reshape(-1, 1)
             b_values = chunk_values_stored.reshape(-1, 1)
         else:
-            # ---------- 下一个 value ----------
             if cfg.freeze_vision_encoder:
                 actor_module.model.vision_encoder.eval()
-            next_obs_cond = actor_module.normalize_inputs(next_obs)
-            next_obs_cond = actor_module.model.encode_observations(next_obs_cond)
-            next_value = critic(next_obs_cond).reshape(1, -1).cpu()
-
-            # ---------- Advantage 计算 ----------
+            with torch.inference_mode():
+                next_obs_cond = actor_module.normalize_inputs(copy.deepcopy(next_obs))
+                next_obs_cond = actor_module.model.encode_observations(next_obs_cond)
+                next_value = critic(next_obs_cond).reshape(1, -1).cpu()
             advantages, returns = calculate_advantage(
                 values_stored, next_value, rewards_stored, dones_stored, next_done,
                 steps_per_iteration, cfg.discount, cfg.gae_lambda
             )
             b_advantages = advantages.reshape(-1, n_action_steps, num_envs_per_process).permute(0, 2, 1).reshape(-1, n_action_steps)
             b_returns = returns.reshape(-1, n_action_steps, num_envs_per_process).permute(0, 2, 1).reshape(-1, n_action_steps)
+
+        return {
+            "b_actions": b_actions,
+            "b_cfm_losses": b_cfm_losses,
+            "b_meanflow_anchor_losses": b_meanflow_anchor_losses,
+            "b_cfm_loss_ts": b_cfm_loss_ts,
+            "b_cfm_loss_rs": b_cfm_loss_rs,
+            "b_cfm_loss_epsilons": b_cfm_loss_epsilons,
+            "b_dppo_log_probs": b_dppo_log_probs,
+            "b_mdp_x_t_paths": b_mdp_x_t_paths,
+            "b_cfm_value_invalid": b_cfm_value_invalid,
+            "b_values": b_values,
+            "b_dones": b_dones,
+            "b_rewards": b_rewards,
+            "b_chunk_rewards": b_chunk_rewards,
+            "b_chunk_discounts": b_chunk_discounts,
+            "b_chunk_dones": b_chunk_dones,
+            "b_chunk_valid_lengths": b_chunk_valid_lengths,
+            "b_obs_images": b_obs_images,
+            "b_obs_state": b_obs_state,
+            "b_advantages": b_advantages,
+            "b_returns": b_returns,
+            "success_rate_global": success_rate_global,
+            "successes_global": successes_global,
+            "episodes_global": episodes_global,
+            "sps_steps": sps_steps,
+            "sps_local_total": sps_local_total,
+        }
+
+    # ----------------- 训练循环 ---------------------
+    logger.info(colored(f"[Rank {rank}] Starting the main training loop", "green"))
+
+    while (iteration * env_steps_per_iteration) < cfg.total_timesteps:
+        iteration += 1
+        if rank == 0:
+            logger.info(colored(
+                f"Iteration: {iteration}/{num_iterations} | "
+                f"Global step (approx): {global_step}/{cfg.total_timesteps}", "yellow"
+            ))
+
+        iteration_start_time = time.time()
+        do_meanflow_bc_stage = (
+            cfg.policy == "meanflow"
+            and cfg.meanflow_bc_stage_epochs > 0
+            and cfg.meanflow_bc_stage_loss_coef > 0
+            and iteration > cfg.n_iterations_train_only_value
+        )
+        use_separate_stage_sampling = do_meanflow_bc_stage and cfg.meanflow_stage_sampling_mode == "separate"
+        meanflow_first = cfg.meanflow_stage_update_order == "meanflow_first"
+        if use_separate_stage_sampling:
+            first_stage_name = "stage_a" if meanflow_first else "stage_b"
+        else:
+            first_stage_name = "shared"
+        active_batch = collect_rollout_batch(first_stage_name, reset_env_for_rollout=cfg.reset_every_iteration)
+
+        def unpack_rollout_batch(batch: Dict[str, Any]):
+            return (
+                batch["b_actions"],
+                batch["b_cfm_losses"],
+                batch["b_meanflow_anchor_losses"],
+                batch["b_cfm_loss_ts"],
+                batch["b_cfm_loss_rs"],
+                batch["b_cfm_loss_epsilons"],
+                batch["b_dppo_log_probs"],
+                batch["b_mdp_x_t_paths"],
+                batch["b_cfm_value_invalid"],
+                batch["b_values"],
+                batch["b_dones"],
+                batch["b_rewards"],
+                batch["b_chunk_rewards"],
+                batch["b_chunk_discounts"],
+                batch["b_chunk_dones"],
+                batch["b_chunk_valid_lengths"],
+                batch["b_obs_images"],
+                batch["b_obs_state"],
+                batch["b_advantages"],
+                batch["b_returns"],
+            )
+
+        (
+            b_actions,
+            b_cfm_losses,
+            b_meanflow_anchor_losses,
+            b_cfm_loss_ts,
+            b_cfm_loss_rs,
+            b_cfm_loss_epsilons,
+            b_dppo_log_probs,
+            b_mdp_x_t_paths,
+            b_cfm_value_invalid,
+            b_values,
+            b_dones,
+            b_rewards,
+            b_chunk_rewards,
+            b_chunk_discounts,
+            b_chunk_dones,
+            b_chunk_valid_lengths,
+            b_obs_images,
+            b_obs_state,
+            b_advantages,
+            b_returns,
+        ) = unpack_rollout_batch(active_batch)
+
+        total_successes_global = active_batch["successes_global"]
+        total_episodes_global = active_batch["episodes_global"]
+        sps_steps = active_batch["sps_steps"]
+        success_rate_global = active_batch["success_rate_global"]
+        sps_local_total = active_batch["sps_local_total"]
 
         # ---------- 策略更新 ----------
         b_inds = np.arange(local_batch_size)
@@ -1470,13 +1671,269 @@ def main(cfg: FlowPPOConfig):
         actor_grad_norm_after = torch.tensor(0.0)
         critic_grad_norm_before = torch.tensor(0.0)
         critic_grad_norm_after = torch.tensor(0.0)
+        meanflow_bc_stage_loss_value = 0.0
+        meanflow_bc_stage_selected_fraction = 0.0
+        meanflow_bc_stage_updates = 0
+
+        def aggregate_sample_loss(loss_tensor: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+            loss_tensor = loss_tensor.reshape(loss_tensor.shape[0], -1, n_groups, group_size)
+            if cfg.do_chunk_level_ppo:
+                expanded_mask = valid_mask.unsqueeze(-1).unsqueeze(-1)
+                if cfg.do_average_cfm_loss_in_chunk:
+                    denom = valid_mask.sum(dim=1).unsqueeze(-1).unsqueeze(-1).clamp_min(1.0)
+                    loss_tensor = (loss_tensor * expanded_mask).sum(dim=1) / denom
+                else:
+                    loss_tensor = (loss_tensor * expanded_mask).sum(dim=1)
+            else:
+                loss_tensor = loss_tensor.mean(dim=-1)
+                return loss_tensor
+            return loss_tensor.mean(dim=-1)
+
+        def get_meanflow_bc_weights(advantages_for_selection: torch.Tensor) -> torch.Tensor:
+            if cfg.rollout_granularity == "chunk":
+                scores = advantages_for_selection[:, 0]
+            else:
+                scores = advantages_for_selection.mean(dim=1)
+
+            if cfg.meanflow_bc_stage_top_fraction is not None:
+                k = max(1, math.ceil(scores.numel() * cfg.meanflow_bc_stage_top_fraction))
+                threshold = torch.topk(scores, k=k, largest=True).values.min()
+                selected = scores >= threshold
+            else:
+                selected = scores > 0
+
+            if cfg.meanflow_bc_stage_adv_weight == "binary":
+                weights = selected.float()
+            elif cfg.meanflow_bc_stage_adv_weight == "relu":
+                weights = torch.relu(scores) * selected.float()
+            elif cfg.meanflow_bc_stage_adv_weight == "normalized":
+                weights = torch.relu(scores) * selected.float()
+                positive_mean = weights[selected].mean() if selected.any() else weights.new_tensor(1.0)
+                weights = weights / positive_mean.clamp_min(1e-8)
+            else:
+                raise ValueError(f"Invalid meanflow_bc_stage_adv_weight: {cfg.meanflow_bc_stage_adv_weight}")
+
+            meanflow_bc_stage_selected_fraction_local = selected.float().mean().item()
+            return weights.detach(), meanflow_bc_stage_selected_fraction_local
+
+        meanflow_preupdate_value = cfg.policy == "meanflow" and cfg.meanflow_value_update_mode != "joint"
+        pg_loss = torch.tensor(0.0, device=device)
+        v_loss = torch.tensor(0.0, device=device)
+        loss = torch.tensor(0.0, device=device)
+
+        def compute_value_loss_for_minibatch(mb_inds):
+            mb_returns_value = b_returns[mb_inds].to(device)
+            mb_values_value = b_values[mb_inds].to(device)
+            mb_cfm_value_invalid_value = b_cfm_value_invalid[mb_inds].to(device)
+            mb_obs_images_value = {k: b_obs_images[k][mb_inds].to(device) for k in b_obs_images.keys()}
+            mb_obs_state_value = b_obs_state[mb_inds].to(device)
+
+            with torch.no_grad():
+                if cfg.rollout_granularity == "chunk":
+                    obs_value = {k: mb_obs_images_value[k][:, 0] for k in mb_obs_images_value.keys()}
+                    obs_value["observation.state"] = mb_obs_state_value[:, 0]
+                    obs_value = actor_module.normalize_inputs(obs_value)
+                    obs_value_cond = actor_module.model.encode_observations(obs_value)
+                else:
+                    obs_value = {k: mb_obs_images_value[k].reshape(-1, 3, img_h, img_w) for k in mb_obs_images_value.keys()}
+                    obs_value["observation.state"] = mb_obs_state_value.reshape(-1, joint_pos_dim)
+                    obs_value = actor_module.normalize_inputs(obs_value)
+                    obs_value_cond = actor_module.model.encode_observations(obs_value)
+
+            if cfg.rollout_granularity == "chunk":
+                newvalue_value = critic(obs_value_cond).reshape(-1, 1)
+            else:
+                newvalue_value = critic(obs_value_cond)
+                newvalue_value = newvalue_value.reshape(mb_returns_value.shape[0], -1)
+
+            if cfg.clip_vloss:
+                v_loss_unclipped = (newvalue_value - mb_returns_value) ** 2
+                v_clipped = mb_values_value + torch.clamp(newvalue_value - mb_values_value, -cfg.clip_coef, cfg.clip_coef)
+                v_loss_clipped = (v_clipped - mb_returns_value) ** 2
+                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped)
+            else:
+                value_loss = 0.5 * ((newvalue_value - mb_returns_value) ** 2)
+            if cfg.rollout_granularity == "chunk":
+                value_loss = value_loss.mean()
+            else:
+                valid_idx_mask_value = 1.0 - mb_cfm_value_invalid_value
+                value_loss = value_loss[valid_idx_mask_value == 1].mean()
+            return value_loss
+
+        def run_value_update(stage_name: str) -> torch.Tensor:
+            nonlocal critic_grad_norm_before, critic_grad_norm_after
+            critic.train()
+            actor.eval()
+            if cfg.freeze_vision_encoder:
+                actor_module.model.vision_encoder.eval()
+
+            value_losses = []
+            for value_epoch in trange(
+                cfg.update_epochs,
+                desc=f"[Rank {rank}] Value update ({stage_name})",
+                disable=(rank != 0),
+            ):
+                value_inds = b_inds.copy()
+                np.random.shuffle(value_inds)
+                accumulation_counter_value = 0
+                optimizer_critic.zero_grad(set_to_none=True)
+                for start in range(0, local_batch_size, minibatch_size):
+                    end = start + minibatch_size
+                    mb_inds_value = value_inds[start:end]
+                    value_loss = compute_value_loss_for_minibatch(mb_inds_value)
+                    (value_loss * cfg.vf_coef / cfg.gradient_accumulation_steps).backward()
+                    value_losses.append(float(value_loss.detach().item()))
+                    accumulation_counter_value += 1
+
+                    if accumulation_counter_value % cfg.gradient_accumulation_steps == 0:
+                        critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                        critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float("inf"))
+                        optimizer_critic.step()
+                        optimizer_critic.zero_grad(set_to_none=True)
+
+                if accumulation_counter_value % cfg.gradient_accumulation_steps != 0:
+                    critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                    critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float("inf"))
+                    optimizer_critic.step()
+                    optimizer_critic.zero_grad(set_to_none=True)
+
+            return torch.tensor(float(np.mean(value_losses)) if value_losses else 0.0, device=device)
+
+        if meanflow_preupdate_value:
+            v_loss = run_value_update(first_stage_name)
+            loss = v_loss
+
+        def run_meanflow_bc_stage() -> None:
+            nonlocal actor_grad_norm_before, actor_grad_norm_after
+            nonlocal meanflow_bc_stage_loss_value, meanflow_bc_stage_selected_fraction, meanflow_bc_stage_updates
+
+            if not do_meanflow_bc_stage:
+                return
+
+            actor.train()
+            if cfg.freeze_vision_encoder:
+                actor_module.model.vision_encoder.eval()
+
+            stage_selected_fractions = []
+            for stage_epoch in trange(
+                cfg.meanflow_bc_stage_epochs,
+                desc=f"[Rank {rank}] MeanFlow BC stage",
+                disable=(rank != 0),
+            ):
+                stage_inds = b_inds.copy()
+                np.random.shuffle(stage_inds)
+                optimizer_actor.zero_grad(set_to_none=True)
+
+                for start in range(0, local_batch_size, minibatch_size):
+                    end = start + minibatch_size
+                    mb_inds = stage_inds[start:end]
+
+                    mb_actions_stage = b_actions[mb_inds].to(device)
+                    mb_cfm_loss_ts_stage = b_cfm_loss_ts[mb_inds].to(device)
+                    mb_cfm_loss_rs_stage = b_cfm_loss_rs[mb_inds].to(device)
+                    mb_cfm_loss_epsilons_stage = b_cfm_loss_epsilons[mb_inds].to(device)
+                    mb_cfm_value_invalid_stage = b_cfm_value_invalid[mb_inds].to(device)
+                    mb_advantages_stage = b_advantages[mb_inds].to(device)
+                    mb_obs_images_stage = {k: b_obs_images[k][mb_inds].to(device) for k in b_obs_images.keys()}
+                    mb_obs_state_stage = b_obs_state[mb_inds].to(device)
+
+                    stage_weights, selected_fraction = get_meanflow_bc_weights(mb_advantages_stage)
+                    stage_selected_fractions.append(selected_fraction)
+                    if stage_weights.sum().item() <= 0:
+                        continue
+
+                    valid_mask_stage = 1.0 - mb_cfm_value_invalid_stage
+                    obs_stage = {k: mb_obs_images_stage[k][:, 0] for k in mb_obs_images_stage.keys()}
+                    obs_stage["observation.state"] = mb_obs_state_stage[:, 0]
+                    obs_stage["action"] = mb_actions_stage
+
+                    old_t_stage_full = mb_cfm_loss_ts_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                    old_t_stage = old_t_stage_full[:, 0:1, :]
+                    old_r_stage_full = mb_cfm_loss_rs_stage.permute(0, 2, 1).reshape(-1, n_action_steps, 1)
+                    old_r_stage = old_r_stage_full[:, 0:1, :]
+                    old_eps_stage = mb_cfm_loss_epsilons_stage.permute(0, 2, 1, 3).reshape(-1, n_action_steps, action_dim)
+
+                    curr_meanflow_loss_stage, _, _, _ = get_cfm_values(
+                        actor,
+                        obs_stage,
+                        n_action_samples,
+                        cfm_loss_ts=old_t_stage,
+                        cfm_loss_rs=old_r_stage,
+                        cfm_loss_epsilons=old_eps_stage,
+                    )
+                    curr_meanflow_loss_stage = curr_meanflow_loss_stage.permute(1, 0, 2)
+                    curr_meanflow_loss_stage = aggregate_sample_loss(
+                        curr_meanflow_loss_stage,
+                        valid_mask_stage,
+                    ).mean(dim=-1)
+
+                    stage_weights = stage_weights.to(curr_meanflow_loss_stage.device)
+                    stage_loss = (
+                        curr_meanflow_loss_stage * stage_weights
+                    ).sum() / stage_weights.sum().clamp_min(1.0)
+                    stage_loss = cfg.meanflow_bc_stage_loss_coef * stage_loss
+                    stage_loss.backward()
+
+                    actor_grad_norm_before = nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+                    actor_grad_norm_after = torch.nn.utils.clip_grad_norm_(actor.parameters(), float("inf"))
+                    optimizer_actor.step()
+                    if hasattr(actor_module, "step_ema"):
+                        actor_module.step_ema()
+                    optimizer_actor.zero_grad(set_to_none=True)
+
+                    meanflow_bc_stage_loss_value = float(stage_loss.detach().item())
+                    meanflow_bc_stage_updates += 1
+
+            if stage_selected_fractions:
+                meanflow_bc_stage_selected_fraction = float(np.mean(stage_selected_fractions))
+
+        if meanflow_first:
+            run_meanflow_bc_stage()
+
+        if use_separate_stage_sampling and meanflow_first:
+            active_batch = collect_rollout_batch("stage_b", reset_env_for_rollout=cfg.reset_every_iteration)
+            (
+                b_actions,
+                b_cfm_losses,
+                b_meanflow_anchor_losses,
+                b_cfm_loss_ts,
+                b_cfm_loss_rs,
+                b_cfm_loss_epsilons,
+                b_dppo_log_probs,
+                b_mdp_x_t_paths,
+                b_cfm_value_invalid,
+                b_values,
+                b_dones,
+                b_rewards,
+                b_chunk_rewards,
+                b_chunk_discounts,
+                b_chunk_dones,
+                b_chunk_valid_lengths,
+                b_obs_images,
+                b_obs_state,
+                b_advantages,
+                b_returns,
+            ) = unpack_rollout_batch(active_batch)
+            total_successes_global += active_batch["successes_global"]
+            total_episodes_global += active_batch["episodes_global"]
+            success_rate_global = (
+                total_successes_global / total_episodes_global if total_episodes_global > 0 else 0.0
+            )
+            sps_steps += active_batch["sps_steps"]
+            sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
+            b_inds = np.arange(local_batch_size)
+
+            if meanflow_preupdate_value and cfg.meanflow_value_update_mode == "each_rollout":
+                v_loss = run_value_update("stage_b")
+                loss = v_loss
 
         for epoch in trange(cfg.update_epochs, desc=f"[Rank {rank}] Policy update", disable=(rank != 0)):
             early_stop = False
             np.random.shuffle(b_inds)
             accumulation_counter = 0
             optimizer_actor.zero_grad(set_to_none=True)
-            optimizer_critic.zero_grad(set_to_none=True)
+            if not meanflow_preupdate_value:
+                optimizer_critic.zero_grad(set_to_none=True)
 
             for start in range(0, local_batch_size, minibatch_size):
                 end = start + minibatch_size
@@ -1484,6 +1941,7 @@ def main(cfg: FlowPPOConfig):
 
                 mb_actions = b_actions[mb_inds].to(device)
                 mb_cfm_losses = b_cfm_losses[mb_inds].to(device)
+                mb_meanflow_anchor_losses = b_meanflow_anchor_losses[mb_inds].to(device)
                 mb_cfm_loss_ts = b_cfm_loss_ts[mb_inds].to(device)
                 mb_cfm_loss_rs = b_cfm_loss_rs[mb_inds].to(device)
                 mb_cfm_loss_epsilons = b_cfm_loss_epsilons[mb_inds].to(device)
@@ -1499,19 +1957,22 @@ def main(cfg: FlowPPOConfig):
                 valid_idx_mask_in_chunk = 1.0 - mb_cfm_value_invalid
 
                 # Critic 前向传播
-                if cfg.rollout_granularity == "chunk":
-                    obs_chunk = {k: mb_obs_images[k][:, 0] for k in mb_obs_images.keys()}
-                    obs_chunk["observation.state"] = mb_obs_state[:, 0]
-                    obs_chunk = actor_module.normalize_inputs(obs_chunk)
-                    obs_chunk_cond = actor_module.model.encode_observations(obs_chunk)
-                    newvalue = critic(obs_chunk_cond).reshape(-1, 1)
+                if not meanflow_preupdate_value:
+                    if cfg.rollout_granularity == "chunk":
+                        obs_chunk = {k: mb_obs_images[k][:, 0] for k in mb_obs_images.keys()}
+                        obs_chunk["observation.state"] = mb_obs_state[:, 0]
+                        obs_chunk = actor_module.normalize_inputs(obs_chunk)
+                        obs_chunk_cond = actor_module.model.encode_observations(obs_chunk)
+                        newvalue = critic(obs_chunk_cond).reshape(-1, 1)
+                    else:
+                        obs_chunk = {k: mb_obs_images[k].reshape(-1, 3, img_h, img_w) for k in mb_obs_images.keys()}
+                        obs_chunk["observation.state"] = mb_obs_state.reshape(-1, joint_pos_dim)
+                        obs_chunk = actor_module.normalize_inputs(obs_chunk)
+                        obs_chunk_cond = actor_module.model.encode_observations(obs_chunk)
+                        newvalue = critic(obs_chunk_cond)
+                        newvalue = newvalue.reshape(mb_returns.shape[0], -1)
                 else:
-                    obs_chunk = {k: mb_obs_images[k].reshape(-1, 3, img_h, img_w) for k in mb_obs_images.keys()}
-                    obs_chunk["observation.state"] = mb_obs_state.reshape(-1, joint_pos_dim)
-                    obs_chunk = actor_module.normalize_inputs(obs_chunk)
-                    obs_chunk_cond = actor_module.model.encode_observations(obs_chunk)
-                    newvalue = critic(obs_chunk_cond)
-                    newvalue = newvalue.reshape(mb_returns.shape[0], -1)
+                    newvalue = None
 
                 if cfg.loss_mode == "fpo":
                     # CFM 损失
@@ -1531,35 +1992,54 @@ def main(cfg: FlowPPOConfig):
                     else:
                         old_cfm_loss_rs = None
 
-                    curr_cfm_loss, _, _, _ = get_cfm_values(
-                        actor,
-                        obs_chunk2,
-                        n_action_samples,
-                        cfm_loss_ts=old_cfm_loss_ts,
-                        cfm_loss_rs=old_cfm_loss_rs,
-                        cfm_loss_epsilons=old_cfm_loss_epsilons,
-                    )
+                    if cfg.policy == "meanflow":
+                        curr_cfm_loss, curr_anchor_loss, _, _, _ = get_cfm_and_anchor_values(
+                            actor,
+                            obs_chunk2,
+                            n_action_samples,
+                            cfm_loss_ts=old_cfm_loss_ts,
+                            cfm_loss_rs=old_cfm_loss_rs,
+                            cfm_loss_epsilons=old_cfm_loss_epsilons,
+                        )
+                    else:
+                        curr_cfm_loss, _, _, _ = get_cfm_values(
+                            actor,
+                            obs_chunk2,
+                            n_action_samples,
+                            cfm_loss_ts=old_cfm_loss_ts,
+                            cfm_loss_rs=old_cfm_loss_rs,
+                            cfm_loss_epsilons=old_cfm_loss_epsilons,
+                        )
+                        curr_anchor_loss = None
                     curr_cfm_loss = curr_cfm_loss.permute(1, 0, 2)
 
                     old_cfm_loss = mb_cfm_losses.reshape(mb_cfm_losses.shape[0], -1, n_groups, group_size)
                     curr_cfm_loss = curr_cfm_loss.reshape(curr_cfm_loss.shape[0], -1, n_groups, group_size)
+                    if curr_anchor_loss is not None:
+                        curr_anchor_loss = curr_anchor_loss.permute(1, 0, 2)
+                        old_anchor_loss = mb_meanflow_anchor_losses.reshape(
+                            mb_meanflow_anchor_losses.shape[0], -1, n_groups, group_size
+                        )
+                        curr_anchor_loss = curr_anchor_loss.reshape(curr_anchor_loss.shape[0], -1, n_groups, group_size)
+                    else:
+                        old_anchor_loss = None
 
                     if cfg.clamp_old_cfm_loss is not None:
                         # old_cfm_loss = torch.clamp(old_cfm_loss, max=cfg.clamp_old_cfm_loss)
                         old_cfm_loss = clamp_ste(old_cfm_loss, max=cfg.clamp_old_cfm_loss)
+                        if old_anchor_loss is not None:
+                            old_anchor_loss = clamp_ste(old_anchor_loss, max=cfg.clamp_old_cfm_loss)
 
                     if cfg.do_chunk_level_ppo:
-                        if cfg.do_average_cfm_loss_in_chunk:
-                            denom = valid_idx_mask_in_chunk.sum(dim=1).unsqueeze(-1).unsqueeze(-1).clamp_min(1.0)
-                            old_cfm_loss = (old_cfm_loss * valid_idx_mask_in_chunk.unsqueeze(-1).unsqueeze(-1)).sum(dim=1) / denom
-                            curr_cfm_loss = (curr_cfm_loss * valid_idx_mask_in_chunk.unsqueeze(-1).unsqueeze(-1)).sum(dim=1) / denom
+                        old_cfm_loss = aggregate_sample_loss(old_cfm_loss, valid_idx_mask_in_chunk)
+                        curr_cfm_loss = aggregate_sample_loss(curr_cfm_loss, valid_idx_mask_in_chunk)
+                        if cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor":
+                            old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
+                            curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
+                            logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
                         else:
-                            old_cfm_loss = (old_cfm_loss * valid_idx_mask_in_chunk.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
-                            curr_cfm_loss = (curr_cfm_loss * valid_idx_mask_in_chunk.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+                            logratio = old_cfm_loss - curr_cfm_loss
 
-                        old_cfm_loss = old_cfm_loss.mean(dim=-1)
-                        curr_cfm_loss = curr_cfm_loss.mean(dim=-1)
-                        logratio = old_cfm_loss - curr_cfm_loss
                         if cfg.clamp_logratio is not None:
                             # logratio = torch.clamp(logratio, min=-cfg.clamp_logratio, max=cfg.clamp_logratio)
                             logratio = clamp_ste(logratio, min=-cfg.clamp_logratio, max=cfg.clamp_logratio)
@@ -1567,9 +2047,15 @@ def main(cfg: FlowPPOConfig):
                         ratio = logratio.exp()
                         mb_advantages = mb_advantages[:, 0:1]
                     else:
-                        old_cfm_loss = old_cfm_loss.mean(dim=-1) # (B, T, n_groups)
-                        curr_cfm_loss = curr_cfm_loss.mean(dim=-1) # (B, T, n_groups)
-                        logratio = old_cfm_loss - curr_cfm_loss
+                        old_cfm_loss = aggregate_sample_loss(old_cfm_loss, valid_idx_mask_in_chunk)
+                        curr_cfm_loss = aggregate_sample_loss(curr_cfm_loss, valid_idx_mask_in_chunk)
+                        if cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor":
+                            old_anchor_loss = aggregate_sample_loss(old_anchor_loss, valid_idx_mask_in_chunk)
+                            curr_anchor_loss = aggregate_sample_loss(curr_anchor_loss, valid_idx_mask_in_chunk)
+                            logratio = cfg.meanflow_anchor_logratio_coef * (old_anchor_loss - curr_anchor_loss)
+                        else:
+                            logratio = old_cfm_loss - curr_cfm_loss
+
                         if cfg.clamp_logratio is not None:
                             # logratio = torch.clamp(logratio, min=-cfg.clamp_logratio, max=cfg.clamp_logratio)
                             logratio = clamp_ste(logratio, min=-cfg.clamp_logratio, max=cfg.clamp_logratio)
@@ -1666,55 +2152,110 @@ def main(cfg: FlowPPOConfig):
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value 损失
-                if cfg.clip_vloss:
-                    v_loss_unclipped = (newvalue - mb_returns) ** 2
-                    v_clipped = mb_values + torch.clamp(newvalue - mb_values, -cfg.clip_coef, cfg.clip_coef)
-                    v_loss_clipped = (v_clipped - mb_returns) ** 2
-                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped)
+                if not meanflow_preupdate_value:
+                    if cfg.clip_vloss:
+                        v_loss_unclipped = (newvalue - mb_returns) ** 2
+                        v_clipped = mb_values + torch.clamp(newvalue - mb_values, -cfg.clip_coef, cfg.clip_coef)
+                        v_loss_clipped = (v_clipped - mb_returns) ** 2
+                        v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped)
+                    else:
+                        v_loss = 0.5 * ((newvalue - mb_returns) ** 2)
+                    if cfg.rollout_granularity == "chunk":
+                        v_loss = v_loss.mean()
+                    else:
+                        v_loss = v_loss[valid_idx_mask_in_chunk == 1].mean()
+                    value_loss_for_backward = v_loss * cfg.vf_coef
                 else:
-                    v_loss = 0.5 * ((newvalue - mb_returns) ** 2)
-                if cfg.rollout_granularity == "chunk":
-                    v_loss = v_loss.mean()
-                else:
-                    v_loss = v_loss[valid_idx_mask_in_chunk == 1].mean()
+                    value_loss_for_backward = 0.0
 
                 # 总损失
                 entropy_loss = -entropy.mean() if cfg.learn_sde_sigma and isinstance(entropy, torch.Tensor) else 0.0
-                policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss if iteration > cfg.n_iterations_train_only_value else 0.0
-                loss = (policy_loss + v_loss * cfg.vf_coef) / cfg.gradient_accumulation_steps
+                if iteration > cfg.n_iterations_train_only_value:
+                    policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss
+                else:
+                    policy_loss = pg_loss * 0.0
+                loss = (policy_loss + value_loss_for_backward) / cfg.gradient_accumulation_steps
                 loss.backward()
                 accumulation_counter += 1
 
                 if accumulation_counter % cfg.gradient_accumulation_steps == 0:
                     # 记录 clipping 前的梯度范数
                     actor_grad_norm_before = nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
-                    critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                    if not meanflow_preupdate_value:
+                        critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
                     # 计算 clipping 后的梯度范数
                     actor_grad_norm_after = torch.nn.utils.clip_grad_norm_(actor.parameters(), float('inf'))
-                    critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float('inf'))
+                    if not meanflow_preupdate_value:
+                        critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float('inf'))
                     optimizer_actor.step()
-                    optimizer_critic.step()
+                    if not meanflow_preupdate_value:
+                        optimizer_critic.step()
                     if hasattr(actor_module, "step_ema"):
                         actor_module.step_ema()
                     optimizer_actor.zero_grad(set_to_none=True)
-                    optimizer_critic.zero_grad(set_to_none=True)
+                    if not meanflow_preupdate_value:
+                        optimizer_critic.zero_grad(set_to_none=True)
 
             if accumulation_counter % cfg.gradient_accumulation_steps != 0:
                 # 记录 clipping 前的梯度范数
                 actor_grad_norm_before = nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
-                critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+                if not meanflow_preupdate_value:
+                    critic_grad_norm_before = nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
                 # 计算 clipping 后的梯度范数
                 actor_grad_norm_after = torch.nn.utils.clip_grad_norm_(actor.parameters(), float('inf'))
-                critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float('inf'))
+                if not meanflow_preupdate_value:
+                    critic_grad_norm_after = torch.nn.utils.clip_grad_norm_(critic.parameters(), float('inf'))
                 optimizer_actor.step()
-                optimizer_critic.step()
+                if not meanflow_preupdate_value:
+                    optimizer_critic.step()
                 if hasattr(actor_module, "step_ema"):
                     actor_module.step_ema()
                 optimizer_actor.zero_grad(set_to_none=True)
-                optimizer_critic.zero_grad(set_to_none=True)
+                if not meanflow_preupdate_value:
+                    optimizer_critic.zero_grad(set_to_none=True)
 
             if early_stop:
                 break
+
+        if do_meanflow_bc_stage and not meanflow_first:
+            if use_separate_stage_sampling:
+                active_batch = collect_rollout_batch("stage_a", reset_env_for_rollout=cfg.reset_every_iteration)
+                (
+                    b_actions,
+                    b_cfm_losses,
+                    b_meanflow_anchor_losses,
+                    b_cfm_loss_ts,
+                    b_cfm_loss_rs,
+                    b_cfm_loss_epsilons,
+                    b_dppo_log_probs,
+                    b_mdp_x_t_paths,
+                    b_cfm_value_invalid,
+                    b_values,
+                    b_dones,
+                    b_rewards,
+                    b_chunk_rewards,
+                    b_chunk_discounts,
+                    b_chunk_dones,
+                    b_chunk_valid_lengths,
+                    b_obs_images,
+                    b_obs_state,
+                    b_advantages,
+                    b_returns,
+                ) = unpack_rollout_batch(active_batch)
+                total_successes_global += active_batch["successes_global"]
+                total_episodes_global += active_batch["episodes_global"]
+                success_rate_global = (
+                    total_successes_global / total_episodes_global if total_episodes_global > 0 else 0.0
+                )
+                sps_steps += active_batch["sps_steps"]
+                sps_local_total = sps_steps / (time.time() - iteration_start_time + 1e-9)
+                b_inds = np.arange(local_batch_size)
+
+                if meanflow_preupdate_value and cfg.meanflow_value_update_mode == "each_rollout":
+                    v_loss = run_value_update("stage_a")
+                    loss = v_loss
+
+            run_meanflow_bc_stage()
 
         # 指标（rank 本地）
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
@@ -1725,6 +2266,7 @@ def main(cfg: FlowPPOConfig):
         # 跟踪 CFM/DPPO 指标用于日志（使用最后一个 minibatch 值作为代表）
         if cfg.loss_mode == "fpo":
             cfm_metrics = {
+                "cfm/ratio_loss_source": 1.0 if (cfg.policy == "meanflow" and cfg.meanflow_fpo_loss_source == "anchor") else 0.0,
                 "cfm/old_cfm_loss_mean": float(old_cfm_loss.mean().item()),
                 "cfm/old_cfm_loss_std": float(old_cfm_loss.std().item()),
                 "cfm/curr_cfm_loss_mean": float(curr_cfm_loss.mean().item()),
@@ -1740,6 +2282,32 @@ def main(cfg: FlowPPOConfig):
                 "cfm/old_cfm_loss_hist": wandb.Histogram(old_cfm_loss.detach().cpu().numpy().flatten()),
                 "cfm/curr_cfm_loss_hist": wandb.Histogram(curr_cfm_loss.detach().cpu().numpy().flatten()),
             }
+            if cfg.policy == "meanflow" and old_anchor_loss is not None and curr_anchor_loss is not None:
+                cfm_metrics.update(
+                    {
+                        "meanflow_anchor/old_loss_mean": float(old_anchor_loss.mean().item()),
+                        "meanflow_anchor/old_loss_std": float(old_anchor_loss.std().item()),
+                        "meanflow_anchor/curr_loss_mean": float(curr_anchor_loss.mean().item()),
+                        "meanflow_anchor/curr_loss_std": float(curr_anchor_loss.std().item()),
+                        "meanflow_anchor/logratio_coef": float(cfg.meanflow_anchor_logratio_coef),
+                        "meanflow_anchor/sampling_mode": 1.0 if cfg.meanflow_anchor_sampling_mode == "schedule" else 0.0,
+                        "meanflow_anchor/sampling_steps": float(cfg.meanflow_anchor_sampling_steps),
+                    }
+                )
+            if cfg.policy == "meanflow":
+                cfm_metrics.update(
+                    {
+                        "meanflow_stage/sampling_mode": 1.0 if cfg.meanflow_stage_sampling_mode == "separate" else 0.0,
+                        "meanflow_stage/used_separate_sampling": float(use_separate_stage_sampling),
+                        "meanflow_stage/update_order": 0.0 if cfg.meanflow_stage_update_order == "meanflow_first" else 1.0,
+                        "meanflow_stage/value_update_mode": float(
+                            {"joint": 0, "first_rollout": 1, "each_rollout": 2}[cfg.meanflow_value_update_mode]
+                        ),
+                        "meanflow_bc_stage/loss": float(meanflow_bc_stage_loss_value),
+                        "meanflow_bc_stage/selected_fraction": float(meanflow_bc_stage_selected_fraction),
+                        "meanflow_bc_stage/updates": float(meanflow_bc_stage_updates),
+                    }
+                )
         else:  # dppo
             cfm_metrics = {
                 "dppo/log_prob_chunk_mean": float(log_prob_chunk.mean().item()),

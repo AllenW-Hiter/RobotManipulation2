@@ -345,7 +345,11 @@ class MeanFlowPolicy(PreTrainedPolicy):
         cfm_loss_r: Tensor = None,
         cfm_loss_eps: Tensor = None, 
         debug=False, 
-        is_dppo: bool = False) -> tuple[Tensor, Tensor, Tensor]:
+        is_dppo: bool = False,
+        return_anchor_loss: bool = False,
+        anchor_sampling_mode: str = "random",
+        anchor_sampling_steps: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if is_dppo:
             return self.forward_dppo(batch, debug)
         else:
@@ -356,6 +360,9 @@ class MeanFlowPolicy(PreTrainedPolicy):
                 cfm_loss_eps=cfm_loss_eps,
                 cfm_loss_r=cfm_loss_r,
                 debug=debug,
+                return_anchor_loss=return_anchor_loss,
+                anchor_sampling_mode=anchor_sampling_mode,
+                anchor_sampling_steps=anchor_sampling_steps,
             )
     
     # 采样 (t, r) 时间对，满足 0 <= r <= t <= 1
@@ -384,15 +391,15 @@ class MeanFlowPolicy(PreTrainedPolicy):
         return t, r
         
     
-    # MeanFlow 训练损失
-    def get_meanflow_loss(
+    def _compute_meanflow_loss_tensors(
         self,
         batch: dict[str, Tensor],
         meanflow_loss_eps: Tensor | None = None,
         meanflow_loss_t: Tensor | None = None,
         meanflow_loss_r: Tensor | None = None,
-        non_reduction: bool = False,
-    ) -> tuple[Tensor, dict]:
+        anchor_sampling_mode: str = "random",
+        anchor_sampling_steps: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         # 归一化输入和目标
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
@@ -456,21 +463,61 @@ class MeanFlowPolicy(PreTrainedPolicy):
                 delta_sq = squared_error.mean(dim=(1, 2))
             power = 1.0 - self.config.meanflow_adaptive_gamma
             weight = (delta_sq + self.config.meanflow_adaptive_c).pow(-power).detach()
-            if non_reduction:
-                return squared_error * weight.view(B, 1, 1)
-            loss = (weight * delta_sq).mean()
-            return loss, {"meanflow_loss": loss.item()}
-
-        if self.config.cfm_loss_use_huber:
-            abs_diff = torch.abs(diff)
-            delta = self.config.cfm_loss_huber_delta
-            loss = torch.where(
-                abs_diff <= delta,
-                diff ** 2,
-                2 * delta * abs_diff - delta ** 2,
-            )
+            meanflow_loss = squared_error * weight.view(B, 1, 1)
         else:
-            loss = diff.square()
+            meanflow_loss = self._compute_squared_error(u, target.detach())
+
+        # Anchor loss 只约束实际采样使用的平均速度 u_theta 指向 replay action。
+        if anchor_sampling_mode == "random":
+            # 复用 MeanFlow residual 的随机 t/r/eps 采样点。
+            anchor_loss = self._compute_squared_error(u, v.detach())
+        elif anchor_sampling_mode == "schedule":
+            if anchor_sampling_steps <= 0:
+                raise ValueError("anchor_sampling_steps must be positive for schedule anchor loss.")
+            schedule = torch.linspace(
+                1.0,
+                0.0,
+                anchor_sampling_steps + 1,
+                device=x_data.device,
+                dtype=x_data.dtype,
+            )
+            anchor_losses = []
+            for i in range(anchor_sampling_steps):
+                t_step = schedule[i]
+                r_step = schedule[i + 1]
+                t_step_batch = torch.full((B,), float(t_step.item()), device=x_data.device, dtype=x_data.dtype)
+                r_step_batch = torch.full((B,), float(r_step.item()), device=x_data.device, dtype=x_data.dtype)
+                t_step_view = t_step_batch.view(B, 1, 1)
+                x_t_step = (1 - t_step_view) * x_data + t_step_view * x_noise
+                time_emb = self.model.encode_time_pair(t_step_batch, r_step_batch)
+                u_step = self.model.forward(x_t=x_t_step, t_emb=time_emb, obs_cond=obs_cond)
+                u_step = self.config.mlp_output_scale * u_step
+                if self.config.transported_clip_value is not None:
+                    u_step = u_step.clamp(
+                        -self.config.transported_clip_value,
+                        self.config.transported_clip_value,
+                    )
+                anchor_losses.append(self._compute_squared_error(u_step, v.detach()))
+            anchor_loss = torch.stack(anchor_losses, dim=0).mean(dim=0)
+        else:
+            raise ValueError(f"Unknown anchor_sampling_mode: {anchor_sampling_mode}")
+        return meanflow_loss, anchor_loss, t, r, x_noise
+
+    # MeanFlow 训练损失
+    def get_meanflow_loss(
+        self,
+        batch: dict[str, Tensor],
+        meanflow_loss_eps: Tensor | None = None,
+        meanflow_loss_t: Tensor | None = None,
+        meanflow_loss_r: Tensor | None = None,
+        non_reduction: bool = False,
+    ) -> tuple[Tensor, dict]:
+        loss, _, _, _, _ = self._compute_meanflow_loss_tensors(
+            batch,
+            meanflow_loss_eps=meanflow_loss_eps,
+            meanflow_loss_t=meanflow_loss_t,
+            meanflow_loss_r=meanflow_loss_r,
+        )
             
         if non_reduction:
             return loss
@@ -496,7 +543,10 @@ class MeanFlowPolicy(PreTrainedPolicy):
         cfm_loss_eps: Tensor | None = None,
         cfm_loss_r: Tensor | None = None,
         debug: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        return_anchor_loss: bool = False,
+        anchor_sampling_mode: str = "random",
+        anchor_sampling_steps: int = 1,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         # 读取动作
         actions = batch[ACTION] # (num_envs, horizon, action_dim)
         B, T, D = actions.shape
@@ -529,17 +579,19 @@ class MeanFlowPolicy(PreTrainedPolicy):
             actions = actions.unsqueeze(1).expand(B, n_action_samples, T, D).reshape(-1, T, D)
             batch[ACTION] = actions
         
-        # 计算 Meanflow 损失
-        loss = self.get_meanflow_loss(
+        # 计算 MeanFlow residual 和动作指向性 anchor loss。
+        loss, anchor_loss, _, _, _ = self._compute_meanflow_loss_tensors(
             batch,
             meanflow_loss_eps=cfm_loss_eps,
             meanflow_loss_t=cfm_loss_t,
             meanflow_loss_r=cfm_loss_r,
-            non_reduction=True,
+            anchor_sampling_mode=anchor_sampling_mode,
+            anchor_sampling_steps=anchor_sampling_steps,
         )
         
         # (B * n_action_samples, T) -> (T,B*n_action_samples) -> (T,B,n_action_samples)
         loss = loss.mean(-1).transpose(0, 1).reshape(T, B, n_action_samples)
+        anchor_loss = anchor_loss.mean(-1).transpose(0, 1).reshape(T, B, n_action_samples)
         
         # (B*n_action_samples, 1, 1) -> (T, B, n_action_samples)
         loss_t = cfm_loss_t.squeeze(-1).transpose(0, 1).expand(T, -1).reshape(T, B, n_action_samples)
@@ -548,6 +600,9 @@ class MeanFlowPolicy(PreTrainedPolicy):
         # (B*n_action_samples, T, D) -> (T, B, n_action_samples, D)
         loss_eps = cfm_loss_eps.permute(1, 0, 2).reshape(T, B, n_action_samples, D)
         
+        if return_anchor_loss:
+            return loss, anchor_loss, loss_t, loss_r, loss_eps
+
         return loss, loss_t,loss_r,loss_eps 
 
     # ------------------------------------------------------------------
