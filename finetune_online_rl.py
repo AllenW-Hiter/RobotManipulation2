@@ -123,6 +123,7 @@ class FlowPPOConfig:
     meanflow_bc_stage_rollout_repeats: int = 1
     meanflow_bc_stage_cache_mode: Literal["memory", "disk"] = "memory"
     meanflow_bc_stage_cache_dir: Optional[str] = None
+    meanflow_bc_update_mode: Literal["staged", "joint"] = "staged"
     meanflow_stage_sampling_mode: Literal["shared", "separate"] = "shared"
     meanflow_value_update_mode: Literal["joint", "first_rollout", "each_rollout"] = "joint"
     meanflow_stage_update_order: Literal["meanflow_first", "anchor_first"] = "meanflow_first"
@@ -827,10 +828,22 @@ def main(cfg: FlowPPOConfig):
             raise ValueError("--meanflow_bc_stage_rollout_repeats must be positive.")
         if cfg.meanflow_bc_stage_top_fraction is not None and not (0 < cfg.meanflow_bc_stage_top_fraction <= 1):
             raise ValueError("--meanflow_bc_stage_top_fraction must be in (0, 1].")
-        if cfg.meanflow_stage_sampling_mode == "separate" and cfg.meanflow_bc_stage_epochs <= 0:
+        if (
+            cfg.meanflow_bc_update_mode == "staged"
+            and cfg.meanflow_stage_sampling_mode == "separate"
+            and cfg.meanflow_bc_stage_epochs <= 0
+        ):
             raise ValueError("--meanflow_stage_sampling_mode separate requires --meanflow_bc_stage_epochs > 0.")
+        if cfg.meanflow_bc_update_mode == "joint":
+            if cfg.meanflow_stage_sampling_mode != "shared":
+                raise ValueError("--meanflow_bc_update_mode joint requires --meanflow_stage_sampling_mode shared.")
+            if cfg.meanflow_bc_stage_rollout_repeats != 1:
+                raise ValueError("--meanflow_bc_stage_rollout_repeats is only used by staged MeanFlow BC.")
+            if cfg.meanflow_bc_stage_cache_mode != "memory" or cfg.meanflow_bc_stage_cache_dir is not None:
+                raise ValueError("MeanFlow joint BC does not use the staged BC cache options.")
         if cfg.meanflow_bc_stage_rollout_repeats > 1 and not (
-            cfg.meanflow_stage_sampling_mode == "separate"
+            cfg.meanflow_bc_update_mode == "staged"
+            and cfg.meanflow_stage_sampling_mode == "separate"
             and cfg.meanflow_stage_update_order == "anchor_first"
         ):
             raise ValueError(
@@ -857,6 +870,8 @@ def main(cfg: FlowPPOConfig):
         raise ValueError("--meanflow_bc_stage_cache_mode is only valid for --policy meanflow.")
     elif cfg.meanflow_bc_stage_cache_dir is not None:
         raise ValueError("--meanflow_bc_stage_cache_dir is only valid for --policy meanflow.")
+    elif cfg.meanflow_bc_update_mode != "staged":
+        raise ValueError("--meanflow_bc_update_mode joint is only valid for --policy meanflow.")
 
 
     # --------- 应用策略覆盖项（所有 rank 必须一致） ----
@@ -1005,6 +1020,7 @@ def main(cfg: FlowPPOConfig):
     rollout_passes_per_iteration = 1.0
     if (
         cfg.policy == "meanflow"
+        and cfg.meanflow_bc_update_mode == "staged"
         and cfg.meanflow_stage_sampling_mode == "separate"
         and cfg.meanflow_bc_stage_epochs > 0
         and cfg.meanflow_bc_stage_loss_coef > 0
@@ -1776,7 +1792,14 @@ def main(cfg: FlowPPOConfig):
         iteration_start_time = time.time()
         meanflow_bc_stage_enabled = (
             cfg.policy == "meanflow"
+            and cfg.meanflow_bc_update_mode == "staged"
             and cfg.meanflow_bc_stage_epochs > 0
+            and cfg.meanflow_bc_stage_loss_coef > 0
+            and iteration > cfg.n_iterations_train_only_value
+        )
+        meanflow_joint_bc_enabled = (
+            cfg.policy == "meanflow"
+            and cfg.meanflow_bc_update_mode == "joint"
             and cfg.meanflow_bc_stage_loss_coef > 0
             and iteration > cfg.n_iterations_train_only_value
         )
@@ -1784,7 +1807,12 @@ def main(cfg: FlowPPOConfig):
             meanflow_bc_stage_enabled
             and iteration % cfg.meanflow_bc_stage_interval == 0
         )
+        meanflow_joint_bc_due = (
+            meanflow_joint_bc_enabled
+            and iteration % cfg.meanflow_bc_stage_interval == 0
+        )
         do_meanflow_bc_stage = meanflow_bc_stage_due
+        do_meanflow_joint_bc = meanflow_joint_bc_due
         use_separate_stage_sampling = do_meanflow_bc_stage and cfg.meanflow_stage_sampling_mode == "separate"
         meanflow_first = cfg.meanflow_stage_update_order == "meanflow_first"
         if use_separate_stage_sampling:
@@ -1870,6 +1898,9 @@ def main(cfg: FlowPPOConfig):
         meanflow_bc_stage_rollout_batches = 0
         meanflow_bc_stage_cached_samples = 0
         meanflow_bc_stage_success_cached_samples = 0
+        meanflow_joint_bc_loss_values: List[float] = []
+        meanflow_joint_bc_selected_fractions: List[float] = []
+        meanflow_joint_bc_updates = 0
         old_anchor_loss_raw_agg = None
         curr_anchor_loss_raw_agg = None
         old_traj_logp = None
@@ -2233,12 +2264,14 @@ def main(cfg: FlowPPOConfig):
                 mb_mdp_x_t_paths = b_mdp_x_t_paths[mb_inds].to(device)
                 mb_cfm_value_invalid = b_cfm_value_invalid[mb_inds].to(device)
                 mb_advantages = b_advantages[mb_inds].to(device)
+                mb_bc_success_mask = b_bc_success_mask[mb_inds].to(device)
                 mb_returns = b_returns[mb_inds].to(device)
                 mb_values = b_values[mb_inds].to(device)
                 mb_obs_images = {k: b_obs_images[k][mb_inds].to(device) for k in b_obs_images.keys()}
                 mb_obs_state = b_obs_state[mb_inds].to(device)
 
                 valid_idx_mask_in_chunk = 1.0 - mb_cfm_value_invalid
+                joint_bc_loss = torch.tensor(0.0, device=device)
 
                 # Critic 前向传播
                 if not meanflow_preupdate_value:
@@ -2379,6 +2412,22 @@ def main(cfg: FlowPPOConfig):
                         ratio = logratio.exp()
                         mb_advantages = mb_advantages.unsqueeze(-1) # (B, T, 1)
 
+                    if do_meanflow_joint_bc:
+                        joint_weights, joint_selected_fraction = get_meanflow_bc_weights(
+                            mb_advantages,
+                            mb_bc_success_mask,
+                        )
+                        meanflow_joint_bc_selected_fractions.append(joint_selected_fraction)
+                        joint_weights = joint_weights.to(curr_cfm_loss.device)
+                        if joint_weights.sum().item() > 0:
+                            curr_meanflow_loss_for_bc = curr_cfm_loss.mean(dim=-1)
+                            joint_bc_loss = (
+                                curr_meanflow_loss_for_bc * joint_weights
+                            ).sum() / joint_weights.sum().clamp_min(1.0)
+                            joint_bc_loss = cfg.meanflow_bc_stage_loss_coef * joint_bc_loss
+                            meanflow_joint_bc_loss_values.append(float(joint_bc_loss.detach().item()))
+                            meanflow_joint_bc_updates += 1
+
                     # TODO
                     entropy = 0.0
 
@@ -2487,7 +2536,7 @@ def main(cfg: FlowPPOConfig):
                 # 总损失
                 entropy_loss = -entropy.mean() if cfg.learn_sde_sigma and isinstance(entropy, torch.Tensor) else 0.0
                 if iteration > cfg.n_iterations_train_only_value:
-                    policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss
+                    policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss + joint_bc_loss
                 else:
                     policy_loss = pg_loss * 0.0
                 loss = (policy_loss + value_loss_for_backward) / cfg.gradient_accumulation_steps
@@ -2706,6 +2755,18 @@ def main(cfg: FlowPPOConfig):
                         "meanflow_stage/value_update_mode": float(
                             {"joint": 0, "first_rollout": 1, "each_rollout": 2}[cfg.meanflow_value_update_mode]
                         ),
+                        "meanflow_bc/update_mode": 1.0 if cfg.meanflow_bc_update_mode == "joint" else 0.0,
+                        "meanflow_joint_bc/enabled": float(meanflow_joint_bc_enabled),
+                        "meanflow_joint_bc/due": float(meanflow_joint_bc_due),
+                        "meanflow_joint_bc/loss": float(
+                            np.mean(meanflow_joint_bc_loss_values) if meanflow_joint_bc_loss_values else 0.0
+                        ),
+                        "meanflow_joint_bc/selected_fraction": float(
+                            np.mean(meanflow_joint_bc_selected_fractions)
+                            if meanflow_joint_bc_selected_fractions
+                            else 0.0
+                        ),
+                        "meanflow_joint_bc/updates": float(meanflow_joint_bc_updates),
                         "meanflow_bc_stage/enabled": float(meanflow_bc_stage_enabled),
                         "meanflow_bc_stage/due": float(meanflow_bc_stage_due),
                         "meanflow_bc_stage/interval": float(cfg.meanflow_bc_stage_interval),
