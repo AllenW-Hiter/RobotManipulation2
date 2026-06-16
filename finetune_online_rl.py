@@ -108,6 +108,7 @@ class FlowPPOConfig:
     exploration_noise_std: Optional[float] = None
     zero_sampling: bool = True  # 已废弃；现在评估时同时使用 zero 和 non-zero sampling
     save_non_zero_sampling_video: bool = False
+    meanflow_use_stable_defaults: bool = True
     meanflow_fpo_loss_source: Literal["cfm", "anchor", "trajectory"] = "cfm"
     meanflow_anchor_logratio_coef: float = 1.0
     meanflow_anchor_sampling_mode: Literal["random", "schedule"] = "random"
@@ -796,6 +797,49 @@ def main(cfg: FlowPPOConfig):
     elif cfg.load_ema and rank == 0:
         logger.warning(colored("--load_ema flag set but no EMA weights found", "yellow"))
 
+    def apply_meanflow_stable_default(name: str, old_default, stable_value) -> None:
+        if getattr(cfg, name) == old_default:
+            setattr(cfg, name, stable_value)
+            if rank == 0:
+                logger.info(
+                    f"[Rank {rank}] MeanFlow stable default: {name}={stable_value} "
+                    f"(was generic default {old_default})"
+                )
+
+    if cfg.policy == "meanflow" and cfg.meanflow_use_stable_defaults:
+        # Stable S2 staged-anchor defaults from
+        # finetune-meanflow-can-s2-anchor2-clip01-successbc-i10-r8-e5-5m.
+        # Only generic defaults are rewritten, so explicit CLI overrides remain effective.
+        apply_meanflow_stable_default("total_timesteps", 1_000_000, 5_000_000)
+        apply_meanflow_stable_default("data_collection_steps", 96, 3008)
+        apply_meanflow_stable_default("num_envs", 2, 16)
+        apply_meanflow_stable_default("rollout_granularity", "step", "chunk")
+        apply_meanflow_stable_default("num_minibatches", 4, 8)
+        apply_meanflow_stable_default("n_iterations_train_only_value", 1, 0)
+        apply_meanflow_stable_default("cfm_loss_use_huber", None, True)
+        apply_meanflow_stable_default("cfm_loss_huber_delta", None, 0.5)
+        apply_meanflow_stable_default("clamp_old_cfm_loss", None, 4)
+        apply_meanflow_stable_default("clamp_old_anchor_loss", None, 4)
+        apply_meanflow_stable_default("clamp_logratio", None, 5)
+        apply_meanflow_stable_default("gae_lambda", 0.95, 0.99)
+        apply_meanflow_stable_default("clip_coef", 0.01, 0.1)
+        apply_meanflow_stable_default("max_grad_norm", 1.0, 5)
+        apply_meanflow_stable_default("log_freq", 10, 1)
+        apply_meanflow_stable_default("save_freq", 100, 10)
+        apply_meanflow_stable_default("eval_num_episodes", 10, 100)
+        apply_meanflow_stable_default("async_env_context", "spawn", "forkserver")
+        apply_meanflow_stable_default("wandb_project", "flow-bc-fpo-finetuning", "meanflow-rl-finetuning")
+        apply_meanflow_stable_default("meanflow_fpo_loss_source", "cfm", "anchor")
+        apply_meanflow_stable_default("meanflow_anchor_sampling_mode", "random", "schedule")
+        apply_meanflow_stable_default("meanflow_anchor_sampling_steps", 1, 2)
+        apply_meanflow_stable_default("meanflow_bc_stage_epochs", 0, 5)
+        apply_meanflow_stable_default("meanflow_bc_stage_selection", "advantage", "success_or_top")
+        apply_meanflow_stable_default("meanflow_bc_stage_top_fraction", None, 0.2)
+        apply_meanflow_stable_default("meanflow_bc_stage_loss_coef", 1.0, 0.5)
+        apply_meanflow_stable_default("meanflow_bc_stage_interval", 1, 10)
+        apply_meanflow_stable_default("meanflow_bc_stage_rollout_repeats", 1, 8)
+        apply_meanflow_stable_default("meanflow_stage_sampling_mode", "shared", "separate")
+        apply_meanflow_stable_default("meanflow_stage_update_order", "meanflow_first", "anchor_first")
 
     if cfg.policy == "meanflow":
         if cfg.loss_mode != "fpo":
@@ -1406,13 +1450,15 @@ def main(cfg: FlowPPOConfig):
                     if cfg.loss_mode == "fpo":
                         obs_chunk_for_cfm = copy.deepcopy(obs_start)
                         obs_chunk_for_cfm["action"] = action_chunks
-                        cfm_loss, maybe_anchor_loss, cfm_loss_t, cfm_loss_r, cfm_loss_eps = get_cfm_and_anchor_values(
+                        cfm_loss, maybe_anchor_loss, cfm_loss_t, maybe_cfm_loss_r, cfm_loss_eps = get_cfm_and_anchor_values(
                             actor,
                             obs_chunk_for_cfm,
                             n_action_samples,
                         )
                         if maybe_anchor_loss is not None:
                             meanflow_anchor_loss = maybe_anchor_loss
+                        if maybe_cfm_loss_r is not None:
+                            cfm_loss_r = maybe_cfm_loss_r
 
                     dppo_log_prob = torch.zeros(
                         (num_envs_per_process, n_action_steps, actor_module.config.sampling_steps),
