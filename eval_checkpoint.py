@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
@@ -109,6 +109,20 @@ class EvalCheckpointConfig:
     """Enable Weights & Biases logging for evaluation results."""
     experiment: str = "eval_checkpoint"
     """Experiment name for logging."""
+
+
+def _drop_unknown_config_fields(config_dict: dict, config_cls: type) -> dict:
+    """Drop stale checkpoint config fields that are not accepted by the current dataclass."""
+    valid_fields = {field.name for field in fields(config_cls)}
+    unknown_fields = sorted(set(config_dict) - valid_fields)
+    if unknown_fields:
+        logger.warning(
+            colored(
+                f"Ignoring config fields not used by {config_cls.__name__}: {unknown_fields}",
+                "yellow",
+            )
+        )
+    return {key: value for key, value in config_dict.items() if key in valid_fields}
 
 
 # -----------------------------------------------------------------------------
@@ -434,10 +448,10 @@ def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = Fal
         config_dict.pop('normalization_mapping', None)
 
     if policy_type == "flowmatching":
-        config = FlowMatchingConfig(**config_dict)
+        config = FlowMatchingConfig(**_drop_unknown_config_fields(config_dict, FlowMatchingConfig))
         policy_cls = FlowMatchingPolicy
     elif policy_type == "meanflow":
-        config = MeanFlowConfig(**config_dict)
+        config = MeanFlowConfig(**_drop_unknown_config_fields(config_dict, MeanFlowConfig))
         policy_cls = MeanFlowPolicy
     else:
         raise ValueError(f"Unsupported policy type in checkpoint config: {policy_type}")

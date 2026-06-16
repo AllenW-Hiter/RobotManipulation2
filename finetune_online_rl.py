@@ -10,7 +10,7 @@ import multiprocessing as mp
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional, Tuple, List, Dict, Any
@@ -49,6 +49,20 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+
+def _drop_unknown_config_fields(config_dict: dict, config_cls: type) -> dict:
+    """Drop stale checkpoint config fields that are not accepted by the current dataclass."""
+    valid_fields = {field.name for field in fields(config_cls)}
+    unknown_fields = sorted(set(config_dict) - valid_fields)
+    if unknown_fields:
+        logger.warning(
+            colored(
+                f"Ignoring config fields not used by {config_cls.__name__}: {unknown_fields}",
+                "yellow",
+            )
+        )
+    return {key: value for key, value in config_dict.items() if key in valid_fields}
 
 
 @dataclass
@@ -760,10 +774,14 @@ def main(cfg: FlowPPOConfig):
 
     # ---------- 在每个 rank 上一致地构建 actor/critic ----------
     if policy_type_payload == "flowmatching":
-        policy_config = FlowMatchingConfig(**policy_config_payload)  # type: ignore[arg-type]
+        policy_config = FlowMatchingConfig(  # type: ignore[arg-type]
+            **_drop_unknown_config_fields(policy_config_payload, FlowMatchingConfig)
+        )
         policy_cls = FlowMatchingPolicy
     elif policy_type_payload == "meanflow":
-        policy_config = MeanFlowConfig(**policy_config_payload)  # type: ignore[arg-type]
+        policy_config = MeanFlowConfig(  # type: ignore[arg-type]
+            **_drop_unknown_config_fields(policy_config_payload, MeanFlowConfig)
+        )
         policy_cls = MeanFlowPolicy
     else:
         raise ValueError(f"Unsupported policy type: {policy_type_payload}")

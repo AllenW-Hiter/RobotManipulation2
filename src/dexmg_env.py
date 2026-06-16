@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import numbers
 import os
 
 from robosuite import macros
@@ -8,10 +9,62 @@ from robosuite import macros
 macros.IMAGE_CONVENTION = "opencv"
 import dexmimicgen  # noqa: F401
 import gymnasium as gym
+import mujoco
 import numpy as np
 import robosuite
+from robosuite.environments import base as robosuite_base
+from robosuite.utils import binding_utils as robosuite_binding_utils
 import torch
 from robosuite import load_composite_controller_config
+
+
+def _patch_robosuite_site_jacobian_lookup() -> None:
+    """Use MuJoCo's native name lookup for site Jacobians.
+
+    Some robosuite/MuJoCo combinations can resolve ``self.model.site_name2id`` to
+    a non-callable object inside async workers. The controllers only need the site
+    id here, so bypass the shim and call MuJoCo directly.
+    """
+
+    def _site_name2id(model, name: str) -> int:
+        site_id = mujoco.mj_name2id(model._model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if site_id < 0:
+            raise ValueError(f'No "site" with name {name} exists.')
+        return site_id
+
+    def get_site_jacp(self, name):
+        site_id = _site_name2id(self.model, name)
+        jacp = np.zeros((3, self.model.nv))
+        mujoco.mj_jacSite(self.model._model, self._data, jacp, None, site_id)
+        return jacp
+
+    def get_site_jacr(self, name):
+        site_id = _site_name2id(self.model, name)
+        jacr = np.zeros((3, self.model.nv))
+        mujoco.mj_jacSite(self.model._model, self._data, None, jacr, site_id)
+        return jacr
+
+    robosuite_binding_utils.MjData.get_site_jacp = get_site_jacp
+    robosuite_binding_utils.MjData.get_site_jacr = get_site_jacr
+
+
+def _patch_robosuite_observable_timestep() -> None:
+    """Recover from non-numeric robosuite model_timestep values in async workers."""
+
+    def _update_observables(self, force=False):
+        timestep = self.model_timestep
+        if not isinstance(timestep, numbers.Real):
+            timestep = float(macros.SIMULATION_TIMESTEP)
+            self.model_timestep = timestep
+
+        for observable in self._observables.values():
+            observable.update(timestep=timestep, obs_cache=self._obs_cache, force=force)
+
+    robosuite_base.MujocoEnv._update_observables = _update_observables
+
+
+_patch_robosuite_site_jacobian_lookup()
+_patch_robosuite_observable_timestep()
 
 # 从规范环境名到对应机器人模型列表的映射
 # 注意：添加新任务时，始终引用 *实际的* robosuite 环境
@@ -282,11 +335,16 @@ class RobosuiteGymWrapper:
         # This is a no-op for compatibility
         return [seed]
 
+    def _ensure_model_timestep(self):
+        if not isinstance(getattr(self.env, "model_timestep", None), numbers.Real):
+            self.env.model_timestep = float(macros.SIMULATION_TIMESTEP)
+
     def reset(self, *, seed=None, options=None):
         """Reset the environment and return initial observation."""
         # Gymnasium interface: reset can accept seed and options
         # For robosuite environments, we'll ignore these for now
         obs = self.env.reset()
+        self._ensure_model_timestep()
         processed_obs = self._process_obs(obs)
         self._last_obs = processed_obs  # Store for video recording
         self.episode_steps = 0
@@ -300,7 +358,9 @@ class RobosuiteGymWrapper:
         if action.ndim > 1:
             action = action[0]  # Take first action if batched
 
+        self._ensure_model_timestep()
         obs, reward, done, info = self.env.step(action)
+        self._ensure_model_timestep()
         self.episode_steps += 1
         # 转换为预期格式
         processed_obs = self._process_obs(obs)
