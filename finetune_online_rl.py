@@ -862,8 +862,8 @@ def main(cfg: FlowPPOConfig):
     if cfg.policy == "meanflow":
         if cfg.loss_mode != "fpo":
             raise ValueError("MeanFlow online RL first stage only supports --loss_mode fpo.")
-        if cfg.rollout_granularity != "chunk":
-            raise ValueError("MeanFlow online RL first stage requires --rollout_granularity chunk.")
+        if cfg.rollout_granularity == "step" and rank == 0:
+            logger.info("MeanFlow step-level rollout enabled: using primitive rewards and step-level GAE.")
         if cfg.learn_sde_sigma:
             raise ValueError("MeanFlow online RL first stage does not support --learn_sde_sigma True.")
         if not cfg.do_chunk_level_ppo:
