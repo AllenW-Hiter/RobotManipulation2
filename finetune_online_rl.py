@@ -1683,9 +1683,10 @@ def main(cfg: FlowPPOConfig):
                     cfm_loss_rs_stored[step - action_idx:step] = cfm_loss_r.detach().cpu()
                 cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.detach().cpu()
 
-                curr_obs_chunk["mdp_x_t_path"] = mdp_x_t_paths_stored[step - action_idx:step].permute(2, 0, 1, 3).to(device)
-                dppo_log_prob, _, _ = get_log_prob_and_entropy(actor, curr_obs_chunk)
-                dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).detach().cpu()
+                if cfg.loss_mode == "dppo":
+                    curr_obs_chunk["mdp_x_t_path"] = mdp_x_t_paths_stored[step - action_idx:step].permute(2, 0, 1, 3).to(device)
+                    dppo_log_prob, _, _ = get_log_prob_and_entropy(actor, curr_obs_chunk)
+                    dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).detach().cpu()
 
                 chunk_dones = dones_stored[step - action_idx:step]
                 cfm_value_invalid_chunk = cfm_value_invalid_stored[step - action_idx:step]
